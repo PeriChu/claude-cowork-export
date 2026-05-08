@@ -44,13 +44,13 @@ python -m pipx ensurepath
 # (open a new shell so PATH picks up)
 
 # install the tool from the windows branch
-pipx install "git+https://github.com/<GITHUB_USER>/claude-cowork-export.git@windows"
+pipx install "git+https://github.com/PeriChu/claude-cowork-export.git@windows"
 ```
 
 Or just clone and run the script directly — it has no third-party deps:
 
 ```powershell
-git clone -b windows https://github.com/<GITHUB_USER>/claude-cowork-export.git
+git clone -b windows https://github.com/PeriChu/claude-cowork-export.git
 cd claude-cowork-export
 python cowork_export.py --help
 ```
@@ -61,7 +61,7 @@ The same script works there too — see the [`macos`](../../tree/macos) branch
 for the original macOS-targeted version, or use this branch:
 
 ```bash
-pipx install "git+https://github.com/<GITHUB_USER>/claude-cowork-export.git@windows"
+pipx install "git+https://github.com/PeriChu/claude-cowork-export.git@windows"
 ```
 
 ## Usage
