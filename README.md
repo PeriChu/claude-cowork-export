@@ -31,13 +31,13 @@ macOS-specific); the legacy `--source code` mode also works on Linux/Windows.
 Recommended (isolated, gives you a `claude-cowork-export` command on PATH):
 
 ```bash
-pipx install git+https://github.com/<GITHUB_USER>/claude-cowork-export.git
+pipx install git+https://github.com/PeriChu/claude-cowork-export.git
 ```
 
 Or just clone and run the script directly — it has no third-party deps:
 
 ```bash
-git clone https://github.com/<GITHUB_USER>/claude-cowork-export.git
+git clone https://github.com/PeriChu/claude-cowork-export.git
 cd claude-cowork-export
 python3 cowork_export.py --help
 ```

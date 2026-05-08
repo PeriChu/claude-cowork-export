@@ -27,9 +27,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/<GITHUB_USER>/claude-cowork-export"
-Repository = "https://github.com/<GITHUB_USER>/claude-cowork-export"
-Issues = "https://github.com/<GITHUB_USER>/claude-cowork-export/issues"
+Homepage = "https://github.com/PeriChu/claude-cowork-export"
+Repository = "https://github.com/PeriChu/claude-cowork-export"
+Issues = "https://github.com/PeriChu/claude-cowork-export/issues"
 
 [project.scripts]
 claude-cowork-export = "cowork_export:main"
