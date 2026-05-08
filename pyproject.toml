@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-cowork-export"
+version = "0.1.0"
+description = "Export Claude Cowork (and legacy Claude Code) sessions to HTML, Markdown, JSON, CSV — with uploads, outputs, and the original transcript bundled."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["claude", "cowork", "claude-code", "export", "transcript", "anthropic"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/<GITHUB_USER>/claude-cowork-export"
+Repository = "https://github.com/<GITHUB_USER>/claude-cowork-export"
+Issues = "https://github.com/<GITHUB_USER>/claude-cowork-export/issues"
+
+[project.scripts]
+claude-cowork-export = "cowork_export:main"
+cowork-export = "cowork_export:main"
+
+[tool.setuptools]
+py-modules = ["cowork_export"]
