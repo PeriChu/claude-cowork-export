@@ -1,10 +1,17 @@
-# claude-cowork-export
+# claude-cowork-export (Windows branch)
 
 Export Claude **Cowork** chats — and legacy Claude Code sessions — to clean
 HTML / Markdown / JSON / CSV bundles, with all uploads, generated outputs, and
 the original transcript packaged alongside.
 
 Zero dependencies (pure Python stdlib, 3.9+). One file, one command.
+
+> This is the **Windows branch**. It auto-detects platform paths
+> (`%APPDATA%\Claude\...` on Windows, `~/Library/Application Support/Claude/...`
+> on macOS, `~/.config/Claude/...` on Linux), reconfigures the console to
+> UTF-8 on Windows so Chinese / emoji titles print correctly, and falls back
+> to case-insensitive path comparison where needed. The macOS-only build
+> lives on the [`macos`](../../tree/macos) branch.
 
 ## Why
 
@@ -23,28 +30,45 @@ miserable. This tool flattens it into:
 - **`uploads/`, `outputs/`, `assets/`** — the actual files.
 - **`transcript.jsonl`, `task.json`, `audit.jsonl`** — the lossless source.
 
-## Install
+## Install (Windows)
 
-Requires Python 3.9+. macOS only for Cowork mode (the path layout is
-macOS-specific); the legacy `--source code` mode also works on Linux/Windows.
+Requires Python 3.9+. Get it from the Microsoft Store, [python.org](https://python.org),
+or `winget install Python.Python.3.12`.
 
 Recommended (isolated, gives you a `claude-cowork-export` command on PATH):
 
-```bash
-pipx install git+https://github.com/<GITHUB_USER>/claude-cowork-export.git
+```powershell
+# install pipx if you don't have it
+python -m pip install --user pipx
+python -m pipx ensurepath
+# (open a new shell so PATH picks up)
+
+# install the tool from the windows branch
+pipx install "git+https://github.com/<GITHUB_USER>/claude-cowork-export.git@windows"
 ```
 
 Or just clone and run the script directly — it has no third-party deps:
 
-```bash
-git clone https://github.com/<GITHUB_USER>/claude-cowork-export.git
+```powershell
+git clone -b windows https://github.com/<GITHUB_USER>/claude-cowork-export.git
 cd claude-cowork-export
-python3 cowork_export.py --help
+python cowork_export.py --help
+```
+
+### Install (macOS / Linux)
+
+The same script works there too — see the [`macos`](../../tree/macos) branch
+for the original macOS-targeted version, or use this branch:
+
+```bash
+pipx install "git+https://github.com/<GITHUB_USER>/claude-cowork-export.git@windows"
 ```
 
 ## Usage
 
-```bash
+Same commands on every platform; only the path conventions differ:
+
+```powershell
 # list all your Cowork chats, newest first
 claude-cowork-export list
 
@@ -52,10 +76,10 @@ claude-cowork-export list
 claude-cowork-export export latest
 
 # export by task-id prefix
-claude-cowork-export export <task-id> --output ./exports
+claude-cowork-export export <task-id> --output .\exports
 
 # export everything
-claude-cowork-export export all --output ./exports
+claude-cowork-export export all --output .\exports
 
 # pick a subset of formats
 claude-cowork-export export latest --formats html,json
@@ -63,7 +87,7 @@ claude-cowork-export export latest --formats html,json
 # don't bundle uploads/outputs/touched files (transcript-only)
 claude-cowork-export export latest --no-files
 
-# legacy Claude Code sessions (~/.claude/projects/...)
+# legacy Claude Code sessions
 claude-cowork-export --source code list
 claude-cowork-export --source code export latest
 ```
@@ -90,7 +114,12 @@ exports/<task-id>/
 ## Where Cowork data lives
 
 - **Cowork tasks (chats):**
-  `~/Library/Application Support/Claude/local-agent-mode-sessions/<account>/<workspace>/`
+  - Windows: `%APPDATA%\Claude\local-agent-mode-sessions\<account>\<workspace>\`
+    (= `C:\Users\<you>\AppData\Roaming\Claude\local-agent-mode-sessions\...`)
+  - macOS: `~/Library/Application Support/Claude/local-agent-mode-sessions/<account>/<workspace>/`
+  - Linux: `~/.config/Claude/local-agent-mode-sessions/<account>/<workspace>/`
+
+  Inside the workspace dir:
   - `local_<task>.json` — task metadata (title, model, dates, initial message)
   - `local_<task>/.claude/projects/<encoded-cwd>/<cli-session>.jsonl` — transcript
   - `local_<task>/uploads/` — user uploads
@@ -98,19 +127,27 @@ exports/<task-id>/
   - `local_<task>/audit.jsonl` — audit log
   - `spaces.json` — space (project) registry, used to derive the chat's space
 - **Legacy Claude Code:** `~/.claude/projects/<encoded-cwd>/<session>.jsonl`
+  (= `C:\Users\<you>\.claude\projects\...` on Windows)
 
 ## Notes & limitations
 
-- **macOS TCC fallback.** When the assistant `Write`s files into protected
-  folders (e.g. `~/Documents/...`), the tool can't always read them back due
-  to macOS sandboxing. In that case it recovers the file from the `Write`
-  tool call's `input.content` field — i.e. the version the assistant
-  originally produced, captured from the transcript itself. This is more
-  faithful than the live filesystem (no risk of being overwritten by later
-  manual edits).
+- **Recorded-content fallback.** When a `Write`-d file isn't readable from
+  disk anymore (deleted, moved, or — on macOS — blocked by TCC for a
+  protected folder), the tool recovers it from the `Write` tool call's
+  `input.content` field captured in the transcript itself. This is the
+  version the assistant originally produced, which is often more faithful
+  than the live filesystem.
 - **`Edit`/`MultiEdit` only.** If a file was only ever modified via diffs
   (no full `Write`) and isn't readable from disk, we can't reconstruct it.
   The README in each bundle notes which paths fell through.
+- **Windows path quirks.** Windows is case-insensitive but Python's
+  `Path.relative_to` isn't, so the Windows branch normalises with
+  `os.path.normcase` when matching paths. Long paths (> 260 chars) may
+  fail unless you've enabled `LongPathsEnabled` in the registry.
+- **Console encoding (Windows).** The script reconfigures stdout/stderr
+  to UTF-8 at startup so Chinese / emoji titles print correctly. If you
+  still see mojibake, run `chcp 65001` before invoking the tool, or use
+  Windows Terminal instead of legacy `cmd.exe`.
 - **Tool-result truncation.** Tool outputs over 8000 chars are truncated in
   HTML / MD for readability. The full text is always preserved in
   `session.json` and `transcript.jsonl`.
