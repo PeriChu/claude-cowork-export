@@ -1368,7 +1368,8 @@ def build_parser() -> argparse.ArgumentParser:
               cowork_export.py export latest --source code
         """),
     )
-    p.add_argument(
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
         "--source",
         default="cowork",
         choices=("cowork", "code", "both"),
@@ -1376,9 +1377,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("list", help="list available sessions").set_defaults(func=cmd_list)
+    sub.add_parser(
+        "list", parents=[common], help="list available sessions"
+    ).set_defaults(func=cmd_list)
 
-    pe = sub.add_parser("export", help="export one or more sessions")
+    pe = sub.add_parser("export", parents=[common], help="export one or more sessions")
     pe.add_argument("session", help="task id (prefix), 'latest', or 'all'")
     pe.add_argument("--output", default=str(DEFAULT_OUTPUT), help=f"output directory (default: {DEFAULT_OUTPUT})")
     pe.add_argument(
