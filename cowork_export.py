@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """cowork_export — export Claude Cowork (or Claude Code) sessions to HTML / Markdown / JSON / CSV.
 
-Cowork stores each chat as a "task" under
-    ~/Library/Application Support/Claude/local-agent-mode-sessions/<account>/<workspace>/
-        local_<task>.json                            # task metadata
-        local_<task>/                                # task working dir
-            .claude/projects/<encoded-cwd>/*.jsonl   # transcript (lossless)
-            uploads/                                 # user-attached files
-            outputs/                                 # files the assistant generated
-            audit.jsonl                              # audit log
-    spaces.json                                      # space (project) registry
+Cowork stores each chat as a "task" under the Claude desktop app's user-data dir:
+    macOS:   ~/Library/Application Support/Claude/local-agent-mode-sessions/<acct>/<ws>/
+    Windows: %APPDATA%\\Claude\\local-agent-mode-sessions\\<acct>\\<ws>\\
+    Linux:   ~/.config/Claude/local-agent-mode-sessions/<acct>/<ws>/
 
-This tool flattens that into HTML / MD / JSON / CSV plus a snapshot of uploads,
-outputs, and any other files the assistant wrote. Falls back to the legacy
-~/.claude/projects/ layout when run with --source code.
+Each task lays out:
+    local_<task>.json                            # task metadata
+    local_<task>/                                # task working dir
+        .claude/projects/<encoded-cwd>/*.jsonl   # transcript (lossless)
+        uploads/                                 # user-attached files
+        outputs/                                 # files the assistant generated
+        audit.jsonl                              # audit log
+spaces.json                                      # space (project) registry
+
+This tool (Windows branch) flattens that into HTML / MD / JSON / CSV plus a
+snapshot of uploads, outputs, and any other files the assistant wrote. Falls
+back to the legacy ~/.claude/projects/ layout when run with --source code.
 
 Usage:
     python cowork_export.py list
     python cowork_export.py export latest
     python cowork_export.py export <task-id-prefix>
-    python cowork_export.py export all --output ./exports
+    python cowork_export.py export all --output .\\exports
     python cowork_export.py export latest --formats html,md
     python cowork_export.py export latest --source code        # legacy code mode
 """
@@ -38,12 +42,56 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except (AttributeError, OSError):
+            pass
+
+
 HOME = Path.home()
-COWORK_ROOT = HOME / "Library" / "Application Support" / "Claude" / "local-agent-mode-sessions"
+
+
+def _detect_cowork_root() -> Path:
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        base = Path(appdata) if appdata else (HOME / "AppData" / "Roaming")
+        return base / "Claude" / "local-agent-mode-sessions"
+    if sys.platform == "darwin":
+        return HOME / "Library" / "Application Support" / "Claude" / "local-agent-mode-sessions"
+    return HOME / ".config" / "Claude" / "local-agent-mode-sessions"
+
+
+COWORK_ROOT = _detect_cowork_root()
 CODE_ROOT = HOME / ".claude" / "projects"
 DEFAULT_OUTPUT = Path.cwd() / "exports"
 SUPPORTED_FORMATS = ("html", "md", "json", "csv")
 TOOL_RESULT_TRUNCATE = 8000
+
+
+def _rel_to(abs_p: Path, base: Path) -> str | None:
+    """Return abs_p relative to base (forward slashes), or None if not under base.
+
+    On Windows, falls back to a case-insensitive comparison because the
+    filesystem is case-insensitive but pathlib.Path.relative_to is strict.
+    """
+    try:
+        return str(abs_p.relative_to(base)).replace("\\", "/")
+    except ValueError:
+        if sys.platform == "win32":
+            try:
+                a_str = os.path.abspath(str(abs_p))
+                b_str = os.path.abspath(str(base))
+                a_norm = os.path.normcase(a_str)
+                b_norm = os.path.normcase(b_str)
+                if a_norm == b_norm:
+                    return ""
+                if a_norm.startswith(b_norm + os.sep):
+                    return a_str[len(b_str) + 1:].replace("\\", "/")
+            except OSError:
+                pass
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -468,11 +516,10 @@ def collect_touched_files(flat: list[FlatMessage], cwd: str) -> list[TouchedFile
             continue
         rel = ""
         if cwd_p:
-            try:
-                rel = str(abs_p.relative_to(cwd_p))
-            except ValueError:
-                rel = ""
-        key = str(abs_p)
+            r = _rel_to(abs_p, cwd_p)
+            if r is not None:
+                rel = r
+        key = os.path.normcase(str(abs_p)) if sys.platform == "win32" else str(abs_p)
         tf = seen.get(key)
         if tf is None:
             tf = TouchedFile(absolute_path=str(abs_p), relative_path=rel, op=op, message_uuid=m.uuid)
@@ -1117,9 +1164,8 @@ def export_one(
             inside_cwd = False
             if cwd_p:
                 try:
-                    src.resolve().relative_to(cwd_p)
-                    inside_cwd = True
-                except (ValueError, OSError):
+                    inside_cwd = _rel_to(src.resolve(), cwd_p) is not None
+                except OSError:
                     inside_cwd = False
             if inside_cwd and outputs_bundle.exists():
                 continue
