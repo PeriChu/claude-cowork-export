@@ -171,18 +171,33 @@ def _load_spaces(workspace_dir: Path) -> tuple[dict[str, str], dict[str, str]]:
 
 
 def _resolve_transcript(task_dir: Path, cli_session_id: str) -> Path | None:
+    """Locate the transcript file for a Cowork task.
+
+    Preference order:
+      1. ``<task>/.claude/projects/<encoded-cwd>/<cli-id>.jsonl`` — Claude Code's
+         native transcript. Present on macOS Cowork.
+      2. ``<task>/audit.jsonl`` — Cowork's audit log, which doubles as the
+         conversation record on Windows where the native transcript is not
+         written to disk (the ``.claude/projects/<encoded-cwd>/`` directory is
+         created but stays empty).
+    """
     pdir = task_dir / ".claude" / "projects"
-    if not pdir.exists():
-        return None
-    candidates = list(pdir.glob("*/*.jsonl"))
-    if not candidates:
-        return None
-    if cli_session_id:
-        for c in candidates:
-            if c.stem == cli_session_id:
-                return c
-    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return candidates[0]
+    if pdir.exists():
+        candidates = list(pdir.glob("*/*.jsonl"))
+        if candidates:
+            if cli_session_id:
+                for c in candidates:
+                    if c.stem == cli_session_id:
+                        return c
+            candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            return candidates[0]
+    audit = task_dir / "audit.jsonl"
+    try:
+        if audit.exists() and audit.stat().st_size > 0:
+            return audit
+    except OSError:
+        pass
+    return None
 
 
 def discover_cowork_tasks(root: Path = COWORK_ROOT) -> list[Task]:
@@ -354,9 +369,30 @@ class FlatMessage:
         return {**self.__dict__}
 
 
+def _normalize_audit_record(obj: dict[str, Any]) -> dict[str, Any] | None:
+    """Adapt an audit.jsonl record to the transcript.jsonl shape that
+    flatten() expects. Returns None for records that should be skipped.
+
+    Differences (audit -> transcript):
+      * ``session_id`` (snake_case) -> ``sessionId``
+      * ``_audit_timestamp`` -> ``timestamp`` (when no transcript timestamp)
+      * ``type=system`` (subtype=init/status/etc.) -> dropped (no convo content)
+      * ``parent_tool_use_id`` left as-is; flatten() does not require parentUuid
+    """
+    t = obj.get("type")
+    if t == "system":
+        return None
+    if "session_id" in obj and "sessionId" not in obj:
+        obj["sessionId"] = obj.pop("session_id")
+    if "timestamp" not in obj and "_audit_timestamp" in obj:
+        obj["timestamp"] = obj.get("_audit_timestamp", "")
+    return obj
+
+
 def load_transcript(jsonl_path: Path) -> tuple[SessionMeta, list[dict[str, Any]]]:
     meta = SessionMeta()
     raw: list[dict[str, Any]] = []
+    is_audit = jsonl_path.name == "audit.jsonl"
     with jsonl_path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -366,6 +402,10 @@ def load_transcript(jsonl_path: Path) -> tuple[SessionMeta, list[dict[str, Any]]
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if is_audit:
+                obj = _normalize_audit_record(obj)
+                if obj is None:
+                    continue
             raw.append(obj)
             if not meta.cli_session_id and obj.get("sessionId"):
                 meta.cli_session_id = obj["sessionId"]
@@ -1143,7 +1183,12 @@ def export_one(
         shutil.copy2(task.task_meta_file, target / "task.json")
     audit_src = (task.task_dir / "audit.jsonl") if task.task_dir else None
     if audit_src and audit_src.exists():
-        shutil.copy2(audit_src, target / "audit.jsonl")
+        try:
+            same_as_transcript = audit_src.resolve() == task.transcript_path.resolve()
+        except OSError:
+            same_as_transcript = False
+        if not same_as_transcript:
+            shutil.copy2(audit_src, target / "audit.jsonl")
 
     uploads_paths: list[Path] = []
     outputs_paths: list[Path] = []
