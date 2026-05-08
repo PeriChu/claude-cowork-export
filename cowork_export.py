@@ -55,9 +55,24 @@ HOME = Path.home()
 
 def _detect_cowork_root() -> Path:
     if sys.platform == "win32":
+        # 1. %APPDATA%\Claude — covers native installers and most Microsoft
+        # Store (MSIX) installs, where Windows publishes a VFS reparse point
+        # under %APPDATA%\Claude that mirrors the package's LocalCache.
         appdata = os.environ.get("APPDATA")
         base = Path(appdata) if appdata else (HOME / "AppData" / "Roaming")
-        return base / "Claude" / "local-agent-mode-sessions"
+        primary = base / "Claude" / "local-agent-mode-sessions"
+        if primary.exists():
+            return primary
+        # 2. MSIX/Store direct lookup — used when the VFS reparse is missing
+        # (reinstall edge cases, enterprise file-system policies, or future
+        # MSIX manifests that drop the legacy %APPDATA% mirror).
+        local = os.environ.get("LOCALAPPDATA")
+        local_base = Path(local) if local else (HOME / "AppData" / "Local")
+        for pkg in sorted((local_base / "Packages").glob("Claude_*")):
+            cand = pkg / "LocalCache" / "Roaming" / "Claude" / "local-agent-mode-sessions"
+            if cand.exists():
+                return cand
+        return primary
     if sys.platform == "darwin":
         return HOME / "Library" / "Application Support" / "Claude" / "local-agent-mode-sessions"
     return HOME / ".config" / "Claude" / "local-agent-mode-sessions"
