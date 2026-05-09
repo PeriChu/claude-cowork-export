@@ -465,10 +465,65 @@ def _normalize_audit_record(obj: dict[str, Any]) -> dict[str, Any] | None:
     return obj
 
 
+def _audit_record_signature(obj: dict[str, Any]) -> tuple | None:
+    """Build a hashable dedup signature for an audit.jsonl record. Returns
+    None to opt out of dedup for that record (e.g. records with no
+    user-facing content).
+
+    Cowork on Windows emits each user prompt twice — and sometimes with a
+    different uuid plus an intervening attachment block — so the simple
+    (uuid, kind) / adjacent-text dedup in flatten() is not enough. We dedup
+    at record-load time by (type, role, content_signature) so spurious
+    repeats are dropped before they ever reach the flat list."""
+    msg = obj.get("message")
+    if not isinstance(msg, dict):
+        return None
+    role = msg.get("role")
+    t = obj.get("type")
+    content = msg.get("content")
+    if isinstance(content, str):
+        text = content.strip()
+        if not text:
+            return None
+        return ("text", t, role, text)
+    if isinstance(content, list):
+        # Pick a stable signature from the first non-trivial block.
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            bt = block.get("type")
+            if bt == "text":
+                text = (block.get("text", "") or "").strip()
+                if text:
+                    return ("text", t, role, text)
+            elif bt == "tool_use":
+                return (
+                    "tool_use",
+                    block.get("id", ""),
+                    block.get("name", ""),
+                    json.dumps(block.get("input"), ensure_ascii=False, sort_keys=True),
+                )
+            elif bt == "tool_result":
+                inner = block.get("content")
+                if isinstance(inner, str):
+                    inner_sig = inner[:400]
+                elif isinstance(inner, list):
+                    inner_sig = json.dumps(inner, ensure_ascii=False)[:400]
+                else:
+                    inner_sig = ""
+                return ("tool_result", block.get("tool_use_id", ""), inner_sig)
+            elif bt == "thinking":
+                text = (block.get("thinking", "") or "").strip()
+                if text:
+                    return ("thinking", t, text[:400])
+    return None
+
+
 def load_transcript(jsonl_path: Path) -> tuple[SessionMeta, list[dict[str, Any]]]:
     meta = SessionMeta()
     raw: list[dict[str, Any]] = []
     is_audit = jsonl_path.name == "audit.jsonl"
+    seen_audit_sigs: set[tuple] = set()
     with jsonl_path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -482,6 +537,11 @@ def load_transcript(jsonl_path: Path) -> tuple[SessionMeta, list[dict[str, Any]]
                 obj = _normalize_audit_record(obj)
                 if obj is None:
                     continue
+                sig = _audit_record_signature(obj)
+                if sig is not None:
+                    if sig in seen_audit_sigs:
+                        continue
+                    seen_audit_sigs.add(sig)
             raw.append(obj)
             if not meta.cli_session_id and obj.get("sessionId"):
                 meta.cli_session_id = obj["sessionId"]
