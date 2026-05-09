@@ -39,7 +39,31 @@ from pathlib import Path
 from typing import Any, Iterable
 
 HOME = Path.home()
-COWORK_ROOT = HOME / "Library" / "Application Support" / "Claude" / "local-agent-mode-sessions"
+
+
+def _cowork_roots() -> list[Path]:
+    """Return every plausible Cowork sessions root for this platform.
+
+    The macOS branch uses a single root, but the API returns a list to match
+    the Windows branch (which merges multiple roots) and to leave room for
+    future cases like custom installs.
+    """
+    if sys.platform == "darwin":
+        cand = HOME / "Library" / "Application Support" / "Claude" / "local-agent-mode-sessions"
+    elif sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        base = Path(appdata) if appdata else (HOME / "AppData" / "Roaming")
+        cand = base / "Claude" / "local-agent-mode-sessions"
+    else:
+        cand = HOME / ".config" / "Claude" / "local-agent-mode-sessions"
+    return [cand] if cand.exists() else []
+
+
+COWORK_ROOT = (
+    _cowork_roots()[0]
+    if _cowork_roots()
+    else HOME / "Library" / "Application Support" / "Claude" / "local-agent-mode-sessions"
+)
 CODE_ROOT = HOME / ".claude" / "projects"
 DEFAULT_OUTPUT = Path.cwd() / "exports"
 SUPPORTED_FORMATS = ("html", "md", "json", "csv")
@@ -108,24 +132,38 @@ def _load_spaces(workspace_dir: Path) -> tuple[dict[str, str], dict[str, str]]:
 
 
 def _resolve_transcript(task_dir: Path, cli_session_id: str) -> Path | None:
+    """Locate the transcript file for a Cowork task.
+
+    Preference order:
+      1. ``<task>/.claude/projects/<encoded-cwd>/<cli-id>.jsonl`` — Claude Code's
+         native transcript.
+      2. ``<task>/audit.jsonl`` — Cowork's audit log, which doubles as the
+         conversation record on platforms / installs where the native
+         transcript is not written to disk.
+    """
     pdir = task_dir / ".claude" / "projects"
-    if not pdir.exists():
-        return None
-    candidates = list(pdir.glob("*/*.jsonl"))
-    if not candidates:
-        return None
-    if cli_session_id:
-        for c in candidates:
-            if c.stem == cli_session_id:
-                return c
-    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return candidates[0]
+    if pdir.exists():
+        candidates = list(pdir.glob("*/*.jsonl"))
+        if candidates:
+            if cli_session_id:
+                for c in candidates:
+                    if c.stem == cli_session_id:
+                        return c
+            candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            return candidates[0]
+    audit = task_dir / "audit.jsonl"
+    try:
+        if audit.exists() and audit.stat().st_size > 0:
+            return audit
+    except OSError:
+        pass
+    return None
 
 
-def discover_cowork_tasks(root: Path = COWORK_ROOT) -> list[Task]:
+def _enumerate_root_tasks(root: Path) -> list[Task]:
+    out: list[Task] = []
     if not root.exists():
-        return []
-    tasks: list[Task] = []
+        return out
     for acct in sorted(root.iterdir()):
         if not acct.is_dir():
             continue
@@ -150,7 +188,7 @@ def discover_cowork_tasks(root: Path = COWORK_ROOT) -> list[Task]:
                     if f in spaces_by_folder:
                         space_name = spaces_by_folder[f]
                         break
-                tasks.append(Task(
+                out.append(Task(
                     source="cowork",
                     task_id=task_id,
                     title=meta.get("title", "") or "",
@@ -169,8 +207,47 @@ def discover_cowork_tasks(root: Path = COWORK_ROOT) -> list[Task]:
                     error=meta.get("error", "") or "",
                     space_name=space_name,
                 ))
-    tasks.sort(key=lambda t: t.last_activity_ms or t.created_at_ms, reverse=True)
-    return tasks
+    return out
+
+
+def _pick_best_task(candidates: list[Task]) -> Task:
+    """Pick the most informative Task record when the same task_id appears
+    across multiple roots. Score: has transcript, transcript size, has
+    task_dir, larger task_meta_file."""
+    if len(candidates) == 1:
+        return candidates[0]
+
+    def _size(p: Path | None) -> int:
+        if not p:
+            return 0
+        try:
+            return p.stat().st_size
+        except OSError:
+            return 0
+
+    def score(t: Task) -> tuple[int, int, int, int]:
+        return (
+            1 if t.transcript_path else 0,
+            _size(t.transcript_path),
+            1 if t.task_dir else 0,
+            _size(t.task_meta_file),
+        )
+
+    return max(candidates, key=score)
+
+
+def discover_cowork_tasks(roots: list[Path] | None = None) -> list[Task]:
+    if roots is None:
+        roots = _cowork_roots()
+    if not roots:
+        return []
+    by_id: dict[str, list[Task]] = {}
+    for root in roots:
+        for t in _enumerate_root_tasks(root):
+            by_id.setdefault(t.task_id, []).append(t)
+    merged = [_pick_best_task(cs) for cs in by_id.values()]
+    merged.sort(key=lambda t: t.last_activity_ms or t.created_at_ms, reverse=True)
+    return merged
 
 
 def discover_code_sessions(root: Path = CODE_ROOT) -> list[Task]:
@@ -214,14 +291,15 @@ def discover_code_sessions(root: Path = CODE_ROOT) -> list[Task]:
     return out
 
 
-def discover(source: str) -> list[Task]:
+def discover(source: str, cowork_root_override: Path | None = None) -> list[Task]:
+    cowork_roots = [cowork_root_override] if cowork_root_override else None
     if source == "cowork":
-        return discover_cowork_tasks()
+        return discover_cowork_tasks(cowork_roots)
     if source == "code":
         return discover_code_sessions()
     if source == "both":
         return sorted(
-            discover_cowork_tasks() + discover_code_sessions(),
+            discover_cowork_tasks(cowork_roots) + discover_code_sessions(),
             key=lambda t: t.last_activity_ms or t.created_at_ms,
             reverse=True,
         )
@@ -291,9 +369,30 @@ class FlatMessage:
         return {**self.__dict__}
 
 
+def _normalize_audit_record(obj: dict[str, Any]) -> dict[str, Any] | None:
+    """Adapt an audit.jsonl record to the transcript.jsonl shape that
+    flatten() expects. Returns None for records that should be skipped.
+
+    Differences (audit -> transcript):
+      * ``session_id`` (snake_case) -> ``sessionId``
+      * ``_audit_timestamp`` -> ``timestamp`` (when no transcript timestamp)
+      * ``type=system`` (subtype=init/status/etc.) -> dropped
+      * ``parent_tool_use_id`` left as-is; flatten() does not require parentUuid
+    """
+    t = obj.get("type")
+    if t == "system":
+        return None
+    if "session_id" in obj and "sessionId" not in obj:
+        obj["sessionId"] = obj.pop("session_id")
+    if "timestamp" not in obj and "_audit_timestamp" in obj:
+        obj["timestamp"] = obj.get("_audit_timestamp", "")
+    return obj
+
+
 def load_transcript(jsonl_path: Path) -> tuple[SessionMeta, list[dict[str, Any]]]:
     meta = SessionMeta()
     raw: list[dict[str, Any]] = []
+    is_audit = jsonl_path.name == "audit.jsonl"
     with jsonl_path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -303,6 +402,10 @@ def load_transcript(jsonl_path: Path) -> tuple[SessionMeta, list[dict[str, Any]]
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if is_audit:
+                obj = _normalize_audit_record(obj)
+                if obj is None:
+                    continue
             raw.append(obj)
             if not meta.cli_session_id and obj.get("sessionId"):
                 meta.cli_session_id = obj["sessionId"]
@@ -349,8 +452,26 @@ def merge_task_meta(meta: SessionMeta, task: Task) -> None:
 
 def flatten(raw: list[dict[str, Any]]) -> list[FlatMessage]:
     flat: list[FlatMessage] = []
+    seen_uuid_kind: set[tuple[str, str]] = set()
+    last_text_signature: tuple[str, str, str] | None = None
 
     def push(**kwargs):
+        # Drop duplicates that share (uuid, kind). audit.jsonl emits each
+        # user prompt twice with the same uuid on some platforms.
+        u = kwargs.get("uuid") or ""
+        k = kwargs.get("kind") or ""
+        if u and (u, k) in seen_uuid_kind:
+            return
+        nonlocal last_text_signature
+        if k == "text":
+            sig = (kwargs.get("role", ""), k, kwargs.get("text", "") or "")
+            if sig[2] and sig == last_text_signature:
+                return
+            last_text_signature = sig
+        else:
+            last_text_signature = None
+        if u:
+            seen_uuid_kind.add((u, k))
         flat.append(FlatMessage(index=len(flat), **kwargs))
 
     for obj in raw:
@@ -737,6 +858,40 @@ header.head .err {{ color: #cf222e; }}
 .toc ol {{ margin: 0; padding-left: 22px; font-size: 13px; }}
 .toc a {{ color: #0969da; text-decoration: none; }}
 .toc a:hover {{ text-decoration: underline; }}
+section.turn {{
+  border: 1px solid var(--border); border-radius: 14px; padding: 18px 20px;
+  margin-bottom: 22px; background: #fff;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+}}
+section.turn .turn-head {{
+  display: flex; align-items: baseline; gap: 12px;
+  font-size: 12px; color: var(--muted);
+  border-bottom: 1px dashed var(--border); padding-bottom: 8px; margin-bottom: 14px;
+}}
+section.turn .turn-num {{
+  font-weight: 700; color: var(--fg); padding: 2px 8px;
+  background: rgba(9,105,218,0.08); border-radius: 999px; font-size: 11px;
+}}
+section.turn .turn-preview {{
+  flex: 1 1 auto; color: var(--fg); font-weight: 500;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}}
+section.turn .turn-ts {{ flex: 0 0 auto; font-variant-numeric: tabular-nums; }}
+section.turn .msg {{ margin-bottom: 12px; }}
+section.turn .msg:last-child {{ margin-bottom: 0; }}
+details.process {{
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 14px; margin: 8px 0 14px;
+  background: rgba(0,0,0,0.02);
+}}
+details.process > summary {{ font-weight: 600; color: var(--muted); }}
+details.process[open] > summary {{ color: var(--fg); }}
+details.process .process-meta {{ font-weight: 400; color: var(--muted); margin-left: 4px; }}
+details.process > .msg {{ margin-top: 10px; }}
+details.preamble {{
+  border: 1px dashed var(--border); border-radius: 8px;
+  padding: 10px 14px; margin-bottom: 18px; color: var(--muted);
+}}
 .msg {{
   border: 1px solid; border-radius: 10px; padding: 14px 18px;
   margin-bottom: 16px; background: #fff; overflow: hidden;
@@ -802,7 +957,9 @@ pre.raw {{
     --att-bg: #161b22; --att-bd: #30363d;
   }}
   body {{ background: var(--bg); }}
-  header.head, .initial, .section, .toc {{ background: #161b22; }}
+  header.head, .initial, .section, .toc, section.turn {{ background: #161b22; }}
+  section.turn .turn-num {{ background: rgba(88,166,255,0.18); }}
+  details.process {{ background: rgba(255,255,255,0.03); }}
   .md th {{ background: #161b22; }}
   .md :not(pre) > code {{ background: rgba(110,118,129,0.4); }}
   .toc a {{ color: #58a6ff; }}
@@ -919,64 +1076,71 @@ def render_html(
             f"<ul>{''.join(items)}</ul></div>"
         )
 
+    preamble, turns = _split_into_turns(flat)
+
     toc_items = []
-    for m in flat:
-        if m.kind == "text" and m.role == "user":
-            preview = _strip_uploaded_files_wrapper(m.text).strip().splitlines()
-            preview = preview[0] if preview else "(empty)"
-            preview = preview[:80] + ("…" if len(preview) > 80 else "")
-            toc_items.append(f"<li><a href=\"#m{m.index}\">{esc(preview)}</a></li>")
+    for i, turn in enumerate(turns):
+        u = turn["user"]
+        preview_src = _strip_uploaded_files_wrapper(u.text).strip().splitlines()
+        preview = preview_src[0] if preview_src else "(empty)"
+        preview = preview[:80] + ("…" if len(preview) > 80 else "")
+        toc_items.append(f"<li><a href=\"#t{i}\">{esc(preview)}</a></li>")
     toc_html = ""
     if toc_items:
         toc_html = f"<div class='toc'><h2>User prompts</h2><ol>{''.join(toc_items)}</ol></div>"
 
     parts: list[str] = []
-    for m in flat:
-        ts = esc(_fmt_ts(m.timestamp))
-        anchor = f"m{m.index}"
-        if m.kind == "text":
-            klass = "user" if m.role == "user" else "assistant"
-            label = m.role.capitalize()
-            text = _strip_uploaded_files_wrapper(m.text)
-            body = f"<div class='md'>{esc(text)}</div>"
-            parts.append(_msg_html(anchor, klass, label, ts, body))
-        elif m.kind == "thinking":
-            body = f"<details><summary>Reasoning</summary><div class='md'>{esc(m.text)}</div></details>"
-            parts.append(_msg_html(anchor, "thinking", "thinking", ts, body))
-        elif m.kind == "tool_use":
-            tn = esc(m.tool_name)
-            inp = json.dumps(m.tool_input, ensure_ascii=False, indent=2) if m.tool_input is not None else ""
-            body = (
-                f"<div><span class='tool-name'>{tn}</span></div>"
-                f"<details><summary>Input</summary>"
-                f"<pre><code class='language-json'>{esc(inp)}</code></pre></details>"
+
+    if preamble:
+        intro_pieces = [_render_block_html(m, esc) for m in preamble if _render_block_html(m, esc)]
+        if intro_pieces:
+            parts.append(
+                "<details class='preamble'><summary>Pre-conversation events "
+                f"({len(intro_pieces)})</summary>{''.join(intro_pieces)}</details>"
             )
-            parts.append(_msg_html(anchor, "tool_use", "tool call", ts, body))
-        elif m.kind == "tool_result":
-            klass = "tool_result error" if m.is_error else "tool_result"
-            label = "tool error" if m.is_error else "tool result"
-            txt = m.text or ""
-            note = ""
-            if len(txt) > TOOL_RESULT_TRUNCATE:
-                note = (
-                    f"<div class='truncated'>…truncated, full text in JSON export "
-                    f"({len(txt)} chars)</div>"
-                )
-                txt = txt[:TOOL_RESULT_TRUNCATE]
-            body = f"<details open><summary>Output</summary><pre class='raw'>{esc(txt)}</pre>{note}</details>"
-            parts.append(_msg_html(anchor, klass, label, ts, body))
-        elif m.kind == "attachment":
-            atype = esc(m.attachment_type)
-            payload = m.attachment_payload or {}
-            preview = json.dumps({k: v for k, v in payload.items() if k != "type"}, ensure_ascii=False)
-            if len(preview) > 600:
-                preview = preview[:600] + " …"
-            body = f"<details><summary>attachment · {atype}</summary><pre class='raw'>{esc(preview)}</pre></details>"
-            parts.append(_msg_html(anchor, "attachment", "attachment", ts, body))
-        elif m.kind == "image":
-            parts.append(_msg_html(anchor, "image", "image", ts, "<em>(image attachment)</em>"))
-        else:
-            parts.append(_msg_html(anchor, "unknown", esc(m.kind), ts, "<em>unhandled block</em>"))
+
+    for i, turn in enumerate(turns):
+        u: FlatMessage = turn["user"]
+        body: list[FlatMessage] = turn["body"]
+        hidden = [m for m in body if m.kind in ("thinking", "tool_use", "tool_result", "attachment", "image", "unknown")]
+        visible_text = [m for m in body if m.kind == "text"]
+
+        ts = esc(_fmt_ts(u.timestamp))
+        user_text = _strip_uploaded_files_wrapper(u.text)
+        prompt_preview = (user_text.strip().splitlines()[0] if user_text.strip() else "(empty)")
+        prompt_preview = prompt_preview[:120] + ("…" if len(prompt_preview) > 120 else "")
+
+        n_tool = sum(1 for m in hidden if m.kind == "tool_use")
+        n_think = sum(1 for m in hidden if m.kind == "thinking")
+        process_summary_bits = []
+        if n_think:
+            process_summary_bits.append(f"{n_think} thinking")
+        if n_tool:
+            process_summary_bits.append(f"{n_tool} tool call{'s' if n_tool != 1 else ''}")
+        n_other = len(hidden) - n_tool - n_think
+        if n_other > 0:
+            process_summary_bits.append(f"{n_other} other")
+        process_summary = " · ".join(process_summary_bits) if process_summary_bits else "no internal steps"
+
+        parts.append(f"<section class='turn' id='t{i}'>")
+        parts.append(
+            f"<div class='turn-head'><span class='turn-num'>#{i + 1}</span>"
+            f"<span class='turn-preview'>{esc(prompt_preview)}</span>"
+            f"<span class='turn-ts'>{ts}</span></div>"
+        )
+        parts.append(
+            f"<div class='msg user'><div class='msg-head'><span class='role'>User</span>"
+            f"<span>{ts}</span></div><div class='msg-body'><div class='md'>{esc(user_text)}</div></div></div>"
+        )
+        if hidden:
+            inner = "".join(_render_block_html(m, esc) for m in hidden)
+            parts.append(
+                f"<details class='process'><summary>Assistant reasoning &amp; tool calls "
+                f"<span class='process-meta'>· {esc(process_summary)}</span></summary>{inner}</details>"
+            )
+        for m in visible_text:
+            parts.append(_render_block_html(m, esc))
+        parts.append("</section>")
 
     return HTML_TEMPLATE.format(
         title=esc(title),
@@ -988,6 +1152,71 @@ def render_html(
         toc=toc_html,
         messages="".join(parts),
     )
+
+
+def _split_into_turns(flat: list[FlatMessage]) -> tuple[list[FlatMessage], list[dict[str, Any]]]:
+    preamble: list[FlatMessage] = []
+    turns: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for m in flat:
+        if m.kind == "text" and m.role == "user":
+            if current is not None:
+                turns.append(current)
+            current = {"user": m, "body": []}
+        elif current is None:
+            preamble.append(m)
+        else:
+            current["body"].append(m)
+    if current is not None:
+        turns.append(current)
+    return preamble, turns
+
+
+def _render_block_html(m: FlatMessage, esc) -> str:
+    ts = esc(_fmt_ts(m.timestamp))
+    anchor = f"m{m.index}"
+    if m.kind == "text":
+        klass = "user" if m.role == "user" else "assistant"
+        label = m.role.capitalize()
+        text = _strip_uploaded_files_wrapper(m.text)
+        body = f"<div class='md'>{esc(text)}</div>"
+        return _msg_html(anchor, klass, label, ts, body)
+    if m.kind == "thinking":
+        body = f"<details open><summary>Reasoning</summary><div class='md'>{esc(m.text)}</div></details>"
+        return _msg_html(anchor, "thinking", "thinking", ts, body)
+    if m.kind == "tool_use":
+        tn = esc(m.tool_name)
+        inp = json.dumps(m.tool_input, ensure_ascii=False, indent=2) if m.tool_input is not None else ""
+        body = (
+            f"<div><span class='tool-name'>{tn}</span></div>"
+            f"<details><summary>Input</summary>"
+            f"<pre><code class='language-json'>{esc(inp)}</code></pre></details>"
+        )
+        return _msg_html(anchor, "tool_use", "tool call", ts, body)
+    if m.kind == "tool_result":
+        klass = "tool_result error" if m.is_error else "tool_result"
+        label = "tool error" if m.is_error else "tool result"
+        txt = m.text or ""
+        note = ""
+        if len(txt) > TOOL_RESULT_TRUNCATE:
+            note = (
+                f"<div class='truncated'>…truncated, full text in JSON export "
+                f"({len(txt)} chars)</div>"
+            )
+            txt = txt[:TOOL_RESULT_TRUNCATE]
+        body = f"<details open><summary>Output</summary><pre class='raw'>{esc(txt)}</pre>{note}</details>"
+        return _msg_html(anchor, klass, label, ts, body)
+    if m.kind == "attachment":
+        atype = esc(m.attachment_type)
+        payload = m.attachment_payload or {}
+        preview = json.dumps({k: v for k, v in payload.items() if k != "type"}, ensure_ascii=False)
+        if len(preview) > 600:
+            preview = preview[:600] + " …"
+        body = f"<details><summary>attachment · {atype}</summary><pre class='raw'>{esc(preview)}</pre></details>"
+        return _msg_html(anchor, "attachment", "attachment", ts, body)
+    if m.kind == "image":
+        return _msg_html(anchor, "image", "image", ts, "<em>(image attachment)</em>")
+    return _msg_html(anchor, "unknown", esc(m.kind), ts, "<em>unhandled block</em>")
 
 
 def _msg_html(anchor: str, klass: str, label: str, ts: str, body: str) -> str:
@@ -1081,7 +1310,12 @@ def export_one(
         shutil.copy2(task.task_meta_file, target / "task.json")
     audit_src = (task.task_dir / "audit.jsonl") if task.task_dir else None
     if audit_src and audit_src.exists():
-        shutil.copy2(audit_src, target / "audit.jsonl")
+        try:
+            same_as_transcript = audit_src.resolve() == task.transcript_path.resolve()
+        except OSError:
+            same_as_transcript = False
+        if not same_as_transcript:
+            shutil.copy2(audit_src, target / "audit.jsonl")
 
     uploads_paths: list[Path] = []
     outputs_paths: list[Path] = []
@@ -1235,9 +1469,10 @@ def _write_readme(
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    tasks = discover(args.source)
+    override = Path(args.cowork_root).expanduser().resolve() if getattr(args, "cowork_root", None) else None
+    tasks = discover(args.source, cowork_root_override=override)
     if not tasks:
-        root = COWORK_ROOT if args.source != "code" else CODE_ROOT
+        root = override or (COWORK_ROOT if args.source != "code" else CODE_ROOT)
         print(f"No sessions found under {root}")
         return 0
     for t in tasks:
@@ -1262,9 +1497,10 @@ def cmd_export(args: argparse.Namespace) -> int:
         print(f"error: unknown format(s): {', '.join(invalid)}", file=sys.stderr)
         return 2
 
-    tasks = discover(args.source)
+    override = Path(args.cowork_root).expanduser().resolve() if getattr(args, "cowork_root", None) else None
+    tasks = discover(args.source, cowork_root_override=override)
     if not tasks:
-        root = COWORK_ROOT if args.source != "code" else CODE_ROOT
+        root = override or (COWORK_ROOT if args.source != "code" else CODE_ROOT)
         print(f"No sessions found under {root}", file=sys.stderr)
         return 1
 
@@ -1307,19 +1543,38 @@ def build_parser() -> argparse.ArgumentParser:
               cowork_export.py export latest --source code
         """),
     )
-    p.add_argument(
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
         "--source",
         default="cowork",
         choices=("cowork", "code", "both"),
         help="which session store to read (default: cowork)",
     )
+    common.add_argument(
+        "--cowork-root",
+        default=None,
+        metavar="PATH",
+        help=(
+            "override the auto-detected Cowork sessions directory. Useful "
+            "when auto-detection misses tasks or when pointing at an "
+            "archived backup of the local-agent-mode-sessions tree."
+        ),
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("list", help="list available sessions").set_defaults(func=cmd_list)
+    sub.add_parser(
+        "list", parents=[common], help="list available sessions"
+    ).set_defaults(func=cmd_list)
 
-    pe = sub.add_parser("export", help="export one or more sessions")
+    pe = sub.add_parser("export", parents=[common], help="export one or more sessions")
     pe.add_argument("session", help="task id (prefix), 'latest', or 'all'")
-    pe.add_argument("--output", default=str(DEFAULT_OUTPUT), help=f"output directory (default: {DEFAULT_OUTPUT})")
+    pe.add_argument(
+        "-o", "--output", "--out",
+        dest="output",
+        default=str(DEFAULT_OUTPUT),
+        metavar="DIR",
+        help=f"directory to write export bundles into (default: {DEFAULT_OUTPUT})",
+    )
     pe.add_argument(
         "--formats",
         default=",".join(SUPPORTED_FORMATS),
