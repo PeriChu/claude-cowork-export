@@ -53,26 +53,56 @@ if sys.platform == "win32":
 HOME = Path.home()
 
 
-def _detect_cowork_root() -> Path:
+def _cowork_roots() -> list[Path]:
+    """Return every plausible Cowork sessions root for this platform.
+
+    On Windows MSIX/Store installs the same workspace is split across two
+    locations and neither is a complete view on its own:
+
+      * ``%APPDATA%\\Claude\\local-agent-mode-sessions`` — the public reparse
+        mirror. Tends to expose only the *currently active* task in full
+        detail (uploads, audit.jsonl, .claude/...). Sibling task directories
+        and their metadata json files may be missing here.
+      * ``%LOCALAPPDATA%\\Packages\\Claude_*\\LocalCache\\Roaming\\Claude\\
+        local-agent-mode-sessions`` — the package's persistent store. Lists
+        every task in the workspace (with metadata + audit.jsonl), but the
+        active task's directory may be a sparse stub here.
+
+    Discovery walks both and merges by task id, picking whichever side has
+    the more complete record per task.
+    """
     if sys.platform == "win32":
-        # 1. %APPDATA%\Claude — covers native installers and most Microsoft
-        # Store (MSIX) installs, where Windows publishes a VFS reparse point
-        # under %APPDATA%\Claude that mirrors the package's LocalCache.
-        appdata = os.environ.get("APPDATA")
-        base = Path(appdata) if appdata else (HOME / "AppData" / "Roaming")
-        primary = base / "Claude" / "local-agent-mode-sessions"
-        if primary.exists():
-            return primary
-        # 2. MSIX/Store direct lookup — used when the VFS reparse is missing
-        # (reinstall edge cases, enterprise file-system policies, or future
-        # MSIX manifests that drop the legacy %APPDATA% mirror).
+        roots: list[Path] = []
         local = os.environ.get("LOCALAPPDATA")
         local_base = Path(local) if local else (HOME / "AppData" / "Local")
         for pkg in sorted((local_base / "Packages").glob("Claude_*")):
             cand = pkg / "LocalCache" / "Roaming" / "Claude" / "local-agent-mode-sessions"
             if cand.exists():
-                return cand
-        return primary
+                roots.append(cand)
+        appdata = os.environ.get("APPDATA")
+        base = Path(appdata) if appdata else (HOME / "AppData" / "Roaming")
+        cand = base / "Claude" / "local-agent-mode-sessions"
+        if cand.exists():
+            roots.append(cand)
+        return roots
+    if sys.platform == "darwin":
+        cand = HOME / "Library" / "Application Support" / "Claude" / "local-agent-mode-sessions"
+    else:
+        cand = HOME / ".config" / "Claude" / "local-agent-mode-sessions"
+    return [cand] if cand.exists() else []
+
+
+def _detect_cowork_root() -> Path:
+    """Best-effort single-root for user-facing messages. Discovery itself
+    iterates over :func:`_cowork_roots`, so this only needs to be plausible
+    for the 'no sessions found under …' warning."""
+    found = _cowork_roots()
+    if found:
+        return found[0]
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        base = Path(appdata) if appdata else (HOME / "AppData" / "Roaming")
+        return base / "Claude" / "local-agent-mode-sessions"
     if sys.platform == "darwin":
         return HOME / "Library" / "Application Support" / "Claude" / "local-agent-mode-sessions"
     return HOME / ".config" / "Claude" / "local-agent-mode-sessions"
@@ -200,10 +230,10 @@ def _resolve_transcript(task_dir: Path, cli_session_id: str) -> Path | None:
     return None
 
 
-def discover_cowork_tasks(root: Path = COWORK_ROOT) -> list[Task]:
+def _enumerate_root_tasks(root: Path) -> list[Task]:
+    out: list[Task] = []
     if not root.exists():
-        return []
-    tasks: list[Task] = []
+        return out
     for acct in sorted(root.iterdir()):
         if not acct.is_dir():
             continue
@@ -228,7 +258,7 @@ def discover_cowork_tasks(root: Path = COWORK_ROOT) -> list[Task]:
                     if f in spaces_by_folder:
                         space_name = spaces_by_folder[f]
                         break
-                tasks.append(Task(
+                out.append(Task(
                     source="cowork",
                     task_id=task_id,
                     title=meta.get("title", "") or "",
@@ -247,8 +277,53 @@ def discover_cowork_tasks(root: Path = COWORK_ROOT) -> list[Task]:
                     error=meta.get("error", "") or "",
                     space_name=space_name,
                 ))
-    tasks.sort(key=lambda t: t.last_activity_ms or t.created_at_ms, reverse=True)
-    return tasks
+    return out
+
+
+def _pick_best_task(candidates: list[Task]) -> Task:
+    """Pick the most informative Task record when the same task_id appears
+    across multiple roots (e.g. APPDATA reparse + MSIX LocalCache on Windows).
+
+    Score:
+      1. has transcript_path (we can actually read the conversation)
+      2. transcript file size (proxy for completeness)
+      3. has task_dir (uploads/outputs reachable)
+      4. larger task_meta_file (active task tends to be richer)
+    """
+    if len(candidates) == 1:
+        return candidates[0]
+
+    def _size(p: Path | None) -> int:
+        if not p:
+            return 0
+        try:
+            return p.stat().st_size
+        except OSError:
+            return 0
+
+    def score(t: Task) -> tuple[int, int, int, int]:
+        return (
+            1 if t.transcript_path else 0,
+            _size(t.transcript_path),
+            1 if t.task_dir else 0,
+            _size(t.task_meta_file),
+        )
+
+    return max(candidates, key=score)
+
+
+def discover_cowork_tasks(roots: list[Path] | None = None) -> list[Task]:
+    if roots is None:
+        roots = _cowork_roots()
+    if not roots:
+        return []
+    by_id: dict[str, list[Task]] = {}
+    for root in roots:
+        for t in _enumerate_root_tasks(root):
+            by_id.setdefault(t.task_id, []).append(t)
+    merged = [_pick_best_task(cs) for cs in by_id.values()]
+    merged.sort(key=lambda t: t.last_activity_ms or t.created_at_ms, reverse=True)
+    return merged
 
 
 def discover_code_sessions(root: Path = CODE_ROOT) -> list[Task]:
@@ -292,14 +367,15 @@ def discover_code_sessions(root: Path = CODE_ROOT) -> list[Task]:
     return out
 
 
-def discover(source: str) -> list[Task]:
+def discover(source: str, cowork_root_override: Path | None = None) -> list[Task]:
+    cowork_roots = [cowork_root_override] if cowork_root_override else None
     if source == "cowork":
-        return discover_cowork_tasks()
+        return discover_cowork_tasks(cowork_roots)
     if source == "code":
         return discover_code_sessions()
     if source == "both":
         return sorted(
-            discover_cowork_tasks() + discover_code_sessions(),
+            discover_cowork_tasks(cowork_roots) + discover_code_sessions(),
             key=lambda t: t.last_activity_ms or t.created_at_ms,
             reverse=True,
         )
@@ -452,8 +528,30 @@ def merge_task_meta(meta: SessionMeta, task: Task) -> None:
 
 def flatten(raw: list[dict[str, Any]]) -> list[FlatMessage]:
     flat: list[FlatMessage] = []
+    seen_uuid_kind: set[tuple[str, str]] = set()
+    last_text_signature: tuple[str, str, str] | None = None
 
     def push(**kwargs):
+        # Drop duplicates that appear as the same (uuid, kind) — Cowork's
+        # audit.jsonl on Windows emits each user prompt twice (once before
+        # and once after the dispatch handshake) and the duplicate carries
+        # the same uuid as the original.
+        u = kwargs.get("uuid") or ""
+        k = kwargs.get("kind") or ""
+        if u and (u, k) in seen_uuid_kind:
+            return
+        # Also drop adjacent identical text blocks (same role + text) when
+        # uuid is missing or differs slightly between the two copies.
+        nonlocal last_text_signature
+        if k == "text":
+            sig = (kwargs.get("role", ""), k, kwargs.get("text", "") or "")
+            if sig[2] and sig == last_text_signature:
+                return
+            last_text_signature = sig
+        else:
+            last_text_signature = None
+        if u:
+            seen_uuid_kind.add((u, k))
         flat.append(FlatMessage(index=len(flat), **kwargs))
 
     for obj in raw:
@@ -839,6 +937,40 @@ header.head .err {{ color: #cf222e; }}
 .toc ol {{ margin: 0; padding-left: 22px; font-size: 13px; }}
 .toc a {{ color: #0969da; text-decoration: none; }}
 .toc a:hover {{ text-decoration: underline; }}
+section.turn {{
+  border: 1px solid var(--border); border-radius: 14px; padding: 18px 20px;
+  margin-bottom: 22px; background: #fff;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+}}
+section.turn .turn-head {{
+  display: flex; align-items: baseline; gap: 12px;
+  font-size: 12px; color: var(--muted);
+  border-bottom: 1px dashed var(--border); padding-bottom: 8px; margin-bottom: 14px;
+}}
+section.turn .turn-num {{
+  font-weight: 700; color: var(--fg); padding: 2px 8px;
+  background: rgba(9,105,218,0.08); border-radius: 999px; font-size: 11px;
+}}
+section.turn .turn-preview {{
+  flex: 1 1 auto; color: var(--fg); font-weight: 500;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}}
+section.turn .turn-ts {{ flex: 0 0 auto; font-variant-numeric: tabular-nums; }}
+section.turn .msg {{ margin-bottom: 12px; }}
+section.turn .msg:last-child {{ margin-bottom: 0; }}
+details.process {{
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 14px; margin: 8px 0 14px;
+  background: rgba(0,0,0,0.02);
+}}
+details.process > summary {{ font-weight: 600; color: var(--muted); }}
+details.process[open] > summary {{ color: var(--fg); }}
+details.process .process-meta {{ font-weight: 400; color: var(--muted); margin-left: 4px; }}
+details.process > .msg {{ margin-top: 10px; }}
+details.preamble {{
+  border: 1px dashed var(--border); border-radius: 8px;
+  padding: 10px 14px; margin-bottom: 18px; color: var(--muted);
+}}
 .msg {{
   border: 1px solid; border-radius: 10px; padding: 14px 18px;
   margin-bottom: 16px; background: #fff; overflow: hidden;
@@ -904,7 +1036,9 @@ pre.raw {{
     --att-bg: #161b22; --att-bd: #30363d;
   }}
   body {{ background: var(--bg); }}
-  header.head, .initial, .section, .toc {{ background: #161b22; }}
+  header.head, .initial, .section, .toc, section.turn {{ background: #161b22; }}
+  section.turn .turn-num {{ background: rgba(88,166,255,0.18); }}
+  details.process {{ background: rgba(255,255,255,0.03); }}
   .md th {{ background: #161b22; }}
   .md :not(pre) > code {{ background: rgba(110,118,129,0.4); }}
   .toc a {{ color: #58a6ff; }}
@@ -1021,64 +1155,74 @@ def render_html(
             f"<ul>{''.join(items)}</ul></div>"
         )
 
+    preamble, turns = _split_into_turns(flat)
+
     toc_items = []
-    for m in flat:
-        if m.kind == "text" and m.role == "user":
-            preview = _strip_uploaded_files_wrapper(m.text).strip().splitlines()
-            preview = preview[0] if preview else "(empty)"
-            preview = preview[:80] + ("…" if len(preview) > 80 else "")
-            toc_items.append(f"<li><a href=\"#m{m.index}\">{esc(preview)}</a></li>")
+    for i, turn in enumerate(turns):
+        u = turn["user"]
+        preview_src = _strip_uploaded_files_wrapper(u.text).strip().splitlines()
+        preview = preview_src[0] if preview_src else "(empty)"
+        preview = preview[:80] + ("…" if len(preview) > 80 else "")
+        toc_items.append(f"<li><a href=\"#t{i}\">{esc(preview)}</a></li>")
     toc_html = ""
     if toc_items:
         toc_html = f"<div class='toc'><h2>User prompts</h2><ol>{''.join(toc_items)}</ol></div>"
 
     parts: list[str] = []
-    for m in flat:
-        ts = esc(_fmt_ts(m.timestamp))
-        anchor = f"m{m.index}"
-        if m.kind == "text":
-            klass = "user" if m.role == "user" else "assistant"
-            label = m.role.capitalize()
-            text = _strip_uploaded_files_wrapper(m.text)
-            body = f"<div class='md'>{esc(text)}</div>"
-            parts.append(_msg_html(anchor, klass, label, ts, body))
-        elif m.kind == "thinking":
-            body = f"<details><summary>Reasoning</summary><div class='md'>{esc(m.text)}</div></details>"
-            parts.append(_msg_html(anchor, "thinking", "thinking", ts, body))
-        elif m.kind == "tool_use":
-            tn = esc(m.tool_name)
-            inp = json.dumps(m.tool_input, ensure_ascii=False, indent=2) if m.tool_input is not None else ""
-            body = (
-                f"<div><span class='tool-name'>{tn}</span></div>"
-                f"<details><summary>Input</summary>"
-                f"<pre><code class='language-json'>{esc(inp)}</code></pre></details>"
+
+    if preamble:
+        intro_pieces = [_render_block_html(m, esc) for m in preamble if _render_block_html(m, esc)]
+        if intro_pieces:
+            parts.append(
+                "<details class='preamble'><summary>Pre-conversation events "
+                f"({len(intro_pieces)})</summary>{''.join(intro_pieces)}</details>"
             )
-            parts.append(_msg_html(anchor, "tool_use", "tool call", ts, body))
-        elif m.kind == "tool_result":
-            klass = "tool_result error" if m.is_error else "tool_result"
-            label = "tool error" if m.is_error else "tool result"
-            txt = m.text or ""
-            note = ""
-            if len(txt) > TOOL_RESULT_TRUNCATE:
-                note = (
-                    f"<div class='truncated'>…truncated, full text in JSON export "
-                    f"({len(txt)} chars)</div>"
-                )
-                txt = txt[:TOOL_RESULT_TRUNCATE]
-            body = f"<details open><summary>Output</summary><pre class='raw'>{esc(txt)}</pre>{note}</details>"
-            parts.append(_msg_html(anchor, klass, label, ts, body))
-        elif m.kind == "attachment":
-            atype = esc(m.attachment_type)
-            payload = m.attachment_payload or {}
-            preview = json.dumps({k: v for k, v in payload.items() if k != "type"}, ensure_ascii=False)
-            if len(preview) > 600:
-                preview = preview[:600] + " …"
-            body = f"<details><summary>attachment · {atype}</summary><pre class='raw'>{esc(preview)}</pre></details>"
-            parts.append(_msg_html(anchor, "attachment", "attachment", ts, body))
-        elif m.kind == "image":
-            parts.append(_msg_html(anchor, "image", "image", ts, "<em>(image attachment)</em>"))
-        else:
-            parts.append(_msg_html(anchor, "unknown", esc(m.kind), ts, "<em>unhandled block</em>"))
+
+    for i, turn in enumerate(turns):
+        u: FlatMessage = turn["user"]
+        body: list[FlatMessage] = turn["body"]
+        hidden = [m for m in body if m.kind in ("thinking", "tool_use", "tool_result", "attachment", "image", "unknown")]
+        visible_text = [m for m in body if m.kind == "text"]
+
+        ts = esc(_fmt_ts(u.timestamp))
+        user_text = _strip_uploaded_files_wrapper(u.text)
+        prompt_preview = (user_text.strip().splitlines()[0] if user_text.strip() else "(empty)")
+        prompt_preview = prompt_preview[:120] + ("…" if len(prompt_preview) > 120 else "")
+
+        n_tool = sum(1 for m in hidden if m.kind == "tool_use")
+        n_think = sum(1 for m in hidden if m.kind == "thinking")
+        process_summary_bits = []
+        if n_think:
+            process_summary_bits.append(f"{n_think} thinking")
+        if n_tool:
+            process_summary_bits.append(f"{n_tool} tool call{'s' if n_tool != 1 else ''}")
+        n_other = len(hidden) - n_tool - n_think
+        if n_other > 0:
+            process_summary_bits.append(f"{n_other} other")
+        process_summary = " · ".join(process_summary_bits) if process_summary_bits else "no internal steps"
+
+        parts.append(f"<section class='turn' id='t{i}'>")
+        parts.append(
+            f"<div class='turn-head'><span class='turn-num'>#{i + 1}</span>"
+            f"<span class='turn-preview'>{esc(prompt_preview)}</span>"
+            f"<span class='turn-ts'>{ts}</span></div>"
+        )
+        # User prompt: visible
+        parts.append(
+            f"<div class='msg user'><div class='msg-head'><span class='role'>User</span>"
+            f"<span>{ts}</span></div><div class='msg-body'><div class='md'>{esc(user_text)}</div></div></div>"
+        )
+        # Process: hidden by default
+        if hidden:
+            inner = "".join(_render_block_html(m, esc) for m in hidden)
+            parts.append(
+                f"<details class='process'><summary>Assistant reasoning &amp; tool calls "
+                f"<span class='process-meta'>· {esc(process_summary)}</span></summary>{inner}</details>"
+            )
+        # Visible assistant text(s)
+        for m in visible_text:
+            parts.append(_render_block_html(m, esc))
+        parts.append("</section>")
 
     return HTML_TEMPLATE.format(
         title=esc(title),
@@ -1090,6 +1234,74 @@ def render_html(
         toc=toc_html,
         messages="".join(parts),
     )
+
+
+def _split_into_turns(flat: list[FlatMessage]) -> tuple[list[FlatMessage], list[dict[str, Any]]]:
+    """Partition flat messages into a preamble (everything before the first
+    user-text) plus a list of conversation turns. A turn opens at a user-text
+    block and runs through every following block up to the next user-text."""
+    preamble: list[FlatMessage] = []
+    turns: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for m in flat:
+        if m.kind == "text" and m.role == "user":
+            if current is not None:
+                turns.append(current)
+            current = {"user": m, "body": []}
+        elif current is None:
+            preamble.append(m)
+        else:
+            current["body"].append(m)
+    if current is not None:
+        turns.append(current)
+    return preamble, turns
+
+
+def _render_block_html(m: FlatMessage, esc) -> str:
+    ts = esc(_fmt_ts(m.timestamp))
+    anchor = f"m{m.index}"
+    if m.kind == "text":
+        klass = "user" if m.role == "user" else "assistant"
+        label = m.role.capitalize()
+        text = _strip_uploaded_files_wrapper(m.text)
+        body = f"<div class='md'>{esc(text)}</div>"
+        return _msg_html(anchor, klass, label, ts, body)
+    if m.kind == "thinking":
+        body = f"<details open><summary>Reasoning</summary><div class='md'>{esc(m.text)}</div></details>"
+        return _msg_html(anchor, "thinking", "thinking", ts, body)
+    if m.kind == "tool_use":
+        tn = esc(m.tool_name)
+        inp = json.dumps(m.tool_input, ensure_ascii=False, indent=2) if m.tool_input is not None else ""
+        body = (
+            f"<div><span class='tool-name'>{tn}</span></div>"
+            f"<details><summary>Input</summary>"
+            f"<pre><code class='language-json'>{esc(inp)}</code></pre></details>"
+        )
+        return _msg_html(anchor, "tool_use", "tool call", ts, body)
+    if m.kind == "tool_result":
+        klass = "tool_result error" if m.is_error else "tool_result"
+        label = "tool error" if m.is_error else "tool result"
+        txt = m.text or ""
+        note = ""
+        if len(txt) > TOOL_RESULT_TRUNCATE:
+            note = (
+                f"<div class='truncated'>…truncated, full text in JSON export "
+                f"({len(txt)} chars)</div>"
+            )
+            txt = txt[:TOOL_RESULT_TRUNCATE]
+        body = f"<details open><summary>Output</summary><pre class='raw'>{esc(txt)}</pre>{note}</details>"
+        return _msg_html(anchor, klass, label, ts, body)
+    if m.kind == "attachment":
+        atype = esc(m.attachment_type)
+        payload = m.attachment_payload or {}
+        preview = json.dumps({k: v for k, v in payload.items() if k != "type"}, ensure_ascii=False)
+        if len(preview) > 600:
+            preview = preview[:600] + " …"
+        body = f"<details><summary>attachment · {atype}</summary><pre class='raw'>{esc(preview)}</pre></details>"
+        return _msg_html(anchor, "attachment", "attachment", ts, body)
+    if m.kind == "image":
+        return _msg_html(anchor, "image", "image", ts, "<em>(image attachment)</em>")
+    return _msg_html(anchor, "unknown", esc(m.kind), ts, "<em>unhandled block</em>")
 
 
 def _msg_html(anchor: str, klass: str, label: str, ts: str, body: str) -> str:
@@ -1341,10 +1553,17 @@ def _write_readme(
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    tasks = discover(args.source)
+    override = Path(args.cowork_root).expanduser().resolve() if getattr(args, "cowork_root", None) else None
+    tasks = discover(args.source, cowork_root_override=override)
     if not tasks:
-        root = COWORK_ROOT if args.source != "code" else CODE_ROOT
+        root = override or (COWORK_ROOT if args.source != "code" else CODE_ROOT)
         print(f"No sessions found under {root}")
+        if args.source != "code" and not override and sys.platform == "win32":
+            scanned = _cowork_roots()
+            if scanned:
+                print("Scanned Cowork roots:", file=sys.stderr)
+                for r in scanned:
+                    print(f"  {r}", file=sys.stderr)
         return 0
     for t in tasks:
         title = t.display_title
@@ -1368,9 +1587,10 @@ def cmd_export(args: argparse.Namespace) -> int:
         print(f"error: unknown format(s): {', '.join(invalid)}", file=sys.stderr)
         return 2
 
-    tasks = discover(args.source)
+    override = Path(args.cowork_root).expanduser().resolve() if getattr(args, "cowork_root", None) else None
+    tasks = discover(args.source, cowork_root_override=override)
     if not tasks:
-        root = COWORK_ROOT if args.source != "code" else CODE_ROOT
+        root = override or (COWORK_ROOT if args.source != "code" else CODE_ROOT)
         print(f"No sessions found under {root}", file=sys.stderr)
         return 1
 
@@ -1420,6 +1640,16 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("cowork", "code", "both"),
         help="which session store to read (default: cowork)",
     )
+    common.add_argument(
+        "--cowork-root",
+        default=None,
+        metavar="PATH",
+        help=(
+            "override the auto-detected Cowork sessions directory "
+            "(e.g. %%LOCALAPPDATA%%\\Packages\\Claude_*\\LocalCache\\Roaming\\Claude\\local-agent-mode-sessions "
+            "on Windows MSIX installs). Useful when auto-detection misses tasks."
+        ),
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser(
@@ -1428,7 +1658,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     pe = sub.add_parser("export", parents=[common], help="export one or more sessions")
     pe.add_argument("session", help="task id (prefix), 'latest', or 'all'")
-    pe.add_argument("--output", default=str(DEFAULT_OUTPUT), help=f"output directory (default: {DEFAULT_OUTPUT})")
+    pe.add_argument(
+        "-o", "--output", "--out",
+        dest="output",
+        default=str(DEFAULT_OUTPUT),
+        metavar="DIR",
+        help=f"directory to write export bundles into (default: {DEFAULT_OUTPUT})",
+    )
     pe.add_argument(
         "--formats",
         default=",".join(SUPPORTED_FORMATS),
