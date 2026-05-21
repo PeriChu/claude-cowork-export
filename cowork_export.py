@@ -68,6 +68,23 @@ CODE_ROOT = HOME / ".claude" / "projects"
 DEFAULT_OUTPUT = Path.cwd() / "exports"
 SUPPORTED_FORMATS = ("html", "md", "json", "csv")
 TOOL_RESULT_TRUNCATE = 8000
+BUNDLE_VERSION = 1
+TOOL_VERSION = "0.2.0"
+
+
+# Auth artefacts Cowork desktop maintains under its userData dir.
+# `Cookies`, `Local State`, Local/Session Storage, etc. are encrypted with the
+# platform's keystore (macOS Keychain, Windows DPAPI) and can only be migrated
+# WITHIN the same platform — they are surface for --include-auth but force an
+# abort for cross-platform import.
+COWORK_AUTH_RELATIVE = [
+    "buddy-tokens.json",
+    "Local State",
+    "Cookies",
+    "Network Persistent State",
+    "ant-did",
+    "TransportSecurity",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -1343,11 +1360,132 @@ def write_csv(path: Path, flat: list[FlatMessage]) -> None:
 # Driver
 # ---------------------------------------------------------------------------
 
+def _cowork_userdata_root() -> Path:
+    """The Cowork desktop user-data dir, parent of local-agent-mode-sessions.
+    Auth artefacts live alongside (Cookies / Local State / etc.)."""
+    if sys.platform == "darwin":
+        return HOME / "Library" / "Application Support" / "Claude"
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        base = Path(appdata) if appdata else (HOME / "AppData" / "Roaming")
+        return base / "Claude"
+    return HOME / ".config" / "Claude"
+
+
+def _confirm_auth_risk(non_interactive_ack: bool) -> None:
+    msg = textwrap.dedent("""\
+        ⚠️  --include-auth requested.
+            The exported bundle will contain Cowork desktop's auth artefacts.
+            Anyone who obtains this bundle can act as your account until you
+            rotate (log out everywhere / change password / revoke device).
+
+            Cross-platform note: most of these artefacts are encrypted with the
+            source platform's keystore (macOS Keychain / Windows DPAPI). They
+            CANNOT be migrated across platforms — import on a different OS will
+            refuse to install them and you'll have to sign in normally.
+
+            Intended uses:
+              - migrating your own Cowork setup to a same-OS device you control
+              - personal backup stored in an encrypted vault
+
+            Do NOT:
+              - share this bundle with anyone
+              - upload to unencrypted cloud storage / chat / email
+        """)
+    print(msg, file=sys.stderr)
+    if non_interactive_ack:
+        print("  ack: --yes-i-know-this-is-risky given; proceeding non-interactively.",
+              file=sys.stderr)
+        return
+    try:
+        ans = input('Type "I UNDERSTAND" to proceed: ').strip()
+    except EOFError:
+        ans = ""
+    if ans != "I UNDERSTAND":
+        print("  abort: confirmation phrase not received.", file=sys.stderr)
+        raise SystemExit(3)
+
+
+def _resolve_auth_sources() -> list[Path]:
+    """Locate every Cowork auth artefact present on this host."""
+    root = _cowork_userdata_root()
+    found: list[Path] = []
+    for rel in COWORK_AUTH_RELATIVE:
+        p = root / rel
+        if p.exists():
+            found.append(p)
+    return found
+
+
+def _copy_auth_for_export(target: Path, sources: list[Path]) -> dict[str, Any]:
+    root = _cowork_userdata_root()
+    auth_dir = target / "auth"
+    auth_dir.mkdir(parents=True, exist_ok=True)
+    files: list[str] = []
+    for src in sources:
+        try:
+            rel = src.relative_to(root)
+        except ValueError:
+            rel = Path(src.name)
+        dst = auth_dir / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_dir():
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+        else:
+            shutil.copy2(src, dst)
+        files.append(str(Path("auth") / rel).replace("\\", "/"))
+        try:
+            os.chmod(dst, 0o600)
+        except OSError:
+            pass
+    return {
+        "included": True,
+        "files": files,
+        "source_userdata": str(root),
+        "source_platform": sys.platform,
+        "encrypted": True,
+        "cross_platform_restorable": False,
+    }
+
+
+def _write_manifest(
+    target: Path,
+    task: Task,
+    meta: SessionMeta,
+    auth_info: dict[str, Any] | None,
+) -> None:
+    sandbox_prefix = ""
+    if task.task_dir is not None:
+        sandbox_prefix = str(task.task_dir.parent.parent.parent)
+    manifest = {
+        "bundle_version": BUNDLE_VERSION,
+        "tool": "claude-cowork-export",
+        "tool_version": TOOL_VERSION,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "source_platform": sys.platform,
+        "source_path_sep": os.sep,
+        "source_home": str(HOME),
+        "source_userdata": str(_cowork_userdata_root()),
+        "source_sandbox_prefix": sandbox_prefix,
+        "source_task_id": task.task_id,
+        "source_cli_session_id": task.cli_session_id,
+        "source_cwd": meta.cwd or "",
+        "source_user_folders": list(meta.user_folders or []),
+        "source_account_hint": "",
+        "auth": auth_info or {"included": False},
+    }
+    (target / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 def export_one(
     task: Task,
     output_root: Path,
     formats: Iterable[str],
     include_files: bool,
+    auth_sources: list[Path] | None = None,
 ) -> Path | None:
     if not task.transcript_path or not task.transcript_path.exists():
         print(f"  warn: skipping {task.task_id} — no transcript file", file=sys.stderr)
@@ -1457,6 +1595,11 @@ def export_one(
         )
     if "csv" in formats:
         write_csv(target / "session.csv", flat)
+
+    auth_info: dict[str, Any] | None = None
+    if auth_sources:
+        auth_info = _copy_auth_for_export(target, auth_sources)
+    _write_manifest(target, task, meta, auth_info)
 
     _write_readme(target, task, meta, flat, touched, uploads_paths, outputs_paths, formats)
     return target
@@ -1573,14 +1716,429 @@ def cmd_export(args: argparse.Namespace) -> int:
     output_root = Path(args.output).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
+    auth_sources: list[Path] | None = None
+    if getattr(args, "include_auth", False):
+        auth_sources = _resolve_auth_sources()
+        if not auth_sources:
+            print(
+                "error: --include-auth requested but no Cowork auth artefacts were\n"
+                f"       found under {_cowork_userdata_root()}.\n"
+                "       Skip --include-auth and sign in on the destination instead.",
+                file=sys.stderr,
+            )
+            return 2
+        _confirm_auth_risk(bool(getattr(args, "yes_i_know_this_is_risky", False)))
+
     exported = 0
     for task in targets:
-        target = export_one(task, output_root, formats, include_files=not args.no_files)
+        target = export_one(
+            task,
+            output_root,
+            formats,
+            include_files=not args.no_files,
+            auth_sources=auth_sources,
+        )
         if target:
             print(f"exported {task.task_id} → {target}")
             exported += 1
     if not exported:
         return 1
+    return 0
+
+
+WINDOWS_RESERVED_CHARS = set('<>:"|?*')
+
+
+def _validate_path_for_windows(path: str) -> str | None:
+    if not path:
+        return None
+    tail = path
+    if len(path) >= 2 and path[1] == ":" and path[0].isalpha():
+        tail = path[2:]
+    bad = sorted({c for c in tail if c in WINDOWS_RESERVED_CHARS})
+    if bad:
+        return f"contains chars not allowed on Windows: {''.join(bad)!r}"
+    return None
+
+
+def _starts_with_path(path: str, prefix: str, platform: str) -> bool:
+    if not path or not prefix:
+        return False
+    if len(path) < len(prefix):
+        return False
+    p, c = (path.lower(), prefix.lower()) if platform == "win32" else (path, prefix)
+    if not p.startswith(c):
+        return False
+    if len(path) == len(prefix):
+        return True
+    return path[len(prefix)] in ("/", "\\")
+
+
+def _rewrite_path_prefix(
+    path: str,
+    src_prefix: str,
+    dst_prefix: str,
+    src_sep: str,
+    dst_sep: str,
+    src_platform: str,
+) -> str:
+    if not path or not _starts_with_path(path, src_prefix, src_platform):
+        return path
+    tail = path[len(src_prefix):]
+    if src_sep != dst_sep:
+        tail = tail.replace(src_sep, dst_sep)
+    return dst_prefix + tail
+
+
+def _apply_remaps(
+    path: str,
+    remaps: list[tuple[str, str]],
+    src_sep: str,
+    dst_sep: str,
+    src_platform: str,
+) -> str:
+    for src, dst in remaps:
+        rewritten = _rewrite_path_prefix(path, src, dst, src_sep, dst_sep, src_platform)
+        if rewritten != path:
+            return rewritten
+    return path
+
+
+def _rewrite_jsonl(
+    src_jsonl: Path,
+    dst_jsonl: Path,
+    cwd_remap: tuple[str, str],
+    extra_remaps: list[tuple[str, str]],
+    src_sep: str,
+    dst_sep: str,
+    src_platform: str,
+) -> dict[str, int]:
+    counts = {"cwd": 0, "file_path": 0, "notebook_path": 0, "records": 0}
+    src_cwd, dst_cwd = cwd_remap
+    all_remaps = [(src_cwd, dst_cwd)] + extra_remaps
+    dst_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    with src_jsonl.open("r", encoding="utf-8") as fin, \
+            dst_jsonl.open("w", encoding="utf-8") as fout:
+        for line in fin:
+            stripped = line.rstrip("\n")
+            if not stripped.strip():
+                fout.write(line); continue
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError:
+                fout.write(line); continue
+            counts["records"] += 1
+            if isinstance(obj.get("cwd"), str):
+                new = _apply_remaps(obj["cwd"], all_remaps, src_sep, dst_sep, src_platform)
+                if new != obj["cwd"]:
+                    counts["cwd"] += 1
+                    obj["cwd"] = new
+            msg = obj.get("message")
+            if isinstance(msg, dict):
+                content = msg.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict) or block.get("type") != "tool_use":
+                            continue
+                        inp = block.get("input")
+                        if not isinstance(inp, dict):
+                            continue
+                        for key in ("file_path", "notebook_path"):
+                            v = inp.get(key)
+                            if isinstance(v, str):
+                                new = _apply_remaps(v, all_remaps, src_sep, dst_sep, src_platform)
+                                if new != v:
+                                    counts[key] += 1
+                                    inp[key] = new
+            fout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    return counts
+
+
+def _rewrite_task_json(
+    src_task_json: Path,
+    dst_task_json: Path,
+    cwd_remap: tuple[str, str],
+    sandbox_remap: tuple[str, str],
+    new_task_id: str,
+    new_cli_session_id: str,
+    extra_remaps: list[tuple[str, str]],
+    src_sep: str,
+    dst_sep: str,
+    src_platform: str,
+) -> dict[str, Any]:
+    data = json.loads(src_task_json.read_text(encoding="utf-8"))
+    all_remaps = [cwd_remap, sandbox_remap] + extra_remaps
+    if isinstance(data.get("cwd"), str):
+        data["cwd"] = _apply_remaps(data["cwd"], all_remaps, src_sep, dst_sep, src_platform)
+    if isinstance(data.get("userSelectedFolders"), list):
+        data["userSelectedFolders"] = [
+            _apply_remaps(p, extra_remaps, src_sep, dst_sep, src_platform) if isinstance(p, str) else p
+            for p in data["userSelectedFolders"]
+        ]
+    if isinstance(data.get("userApprovedFileAccessPaths"), list):
+        data["userApprovedFileAccessPaths"] = [
+            _apply_remaps(p, extra_remaps, src_sep, dst_sep, src_platform) if isinstance(p, str) else p
+            for p in data["userApprovedFileAccessPaths"]
+        ]
+    data["sessionId"] = f"local_{new_task_id}"
+    if new_cli_session_id:
+        data["cliSessionId"] = new_cli_session_id
+    data["processName"] = f"imported-{new_task_id[:8]}"
+    data["vmProcessName"] = data["processName"]
+    dst_task_json.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return data
+
+
+def _pick_target_workspace(roots: list[Path], workspace_arg: str | None) -> tuple[Path, Path, Path]:
+    """Return (root, acct, workspace) on the target machine. Errors out if
+    detection is ambiguous and the user did not specify --workspace."""
+    if not roots:
+        raise SystemExit("error: no Cowork install detected on this machine.")
+    if workspace_arg:
+        target = Path(workspace_arg).expanduser().resolve()
+        if not target.is_dir():
+            raise SystemExit(f"error: --workspace {target} does not exist")
+        acct = target.parent
+        for r in roots:
+            try:
+                target.relative_to(r)
+                return r, acct, target
+            except ValueError:
+                continue
+        raise SystemExit(f"error: --workspace {target} is not inside any detected Cowork root")
+    root = roots[0]
+    accts = sorted([
+        p for p in root.iterdir()
+        if p.is_dir() and p.name != "skills-plugin"
+    ])
+    if not accts:
+        raise SystemExit(f"error: no account directories found under {root}")
+    if len(accts) > 1:
+        raise SystemExit(
+            "error: multiple Cowork accounts detected; pick one with --workspace:\n  "
+            + "\n  ".join(str(a) for a in accts)
+        )
+    workspaces = sorted([p for p in accts[0].iterdir() if p.is_dir() and p.name != "skills-plugin"])
+    if not workspaces:
+        raise SystemExit(f"error: no workspaces found under {accts[0]}")
+    if len(workspaces) > 1:
+        raise SystemExit(
+            "error: multiple workspaces detected; pick one with --workspace:\n  "
+            + "\n  ".join(str(w) for w in workspaces)
+        )
+    return root, accts[0], workspaces[0]
+
+
+def cmd_import(args: argparse.Namespace) -> int:
+    import uuid as _uuid
+    bundle = Path(args.bundle).expanduser().resolve()
+    if not bundle.is_dir():
+        print(f"error: bundle directory does not exist: {bundle}", file=sys.stderr)
+        return 2
+    manifest_path = bundle / "manifest.json"
+    if not manifest_path.exists():
+        print(
+            f"error: not a valid bundle (missing manifest.json): {bundle}\n"
+            f"       Bundles produced before tool 0.2.0 lack a manifest. Re-export.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"error: failed to parse manifest.json: {e}", file=sys.stderr)
+        return 2
+    if manifest.get("tool") != "claude-cowork-export":
+        print(
+            f"error: bundle was produced by {manifest.get('tool')!r}, expected "
+            "'claude-cowork-export'.",
+            file=sys.stderr,
+        )
+        return 2
+
+    src_platform = manifest.get("source_platform") or ""
+    src_sep = manifest.get("source_path_sep") or ("\\" if src_platform == "win32" else "/")
+    src_cwd = manifest.get("source_cwd") or ""
+    src_sandbox = manifest.get("source_sandbox_prefix") or ""
+    src_task_id = manifest.get("source_task_id") or ""
+    src_user_folders = manifest.get("source_user_folders") or []
+    bundle_auth = bundle / "auth"
+
+    dst_platform = sys.platform
+    dst_sep = "\\" if dst_platform == "win32" else "/"
+
+    # Cross-platform auth refusal
+    has_auth = bundle_auth.is_dir() and any(bundle_auth.iterdir())
+    install_auth = has_auth and not args.skip_auth
+    if install_auth and src_platform != dst_platform:
+        print(
+            f"error: bundle was exported on {src_platform}; importing on {dst_platform} cannot\n"
+            "       reuse Cowork desktop auth (macOS Keychain ↔ Windows DPAPI keys are not\n"
+            "       interoperable). Re-run with --skip-auth and sign in on the destination.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Parse --remap flags
+    remaps: list[tuple[str, str]] = []
+    for r in (args.remap or []):
+        if "=" not in r:
+            print(f"error: --remap expects src=dst, got {r!r}", file=sys.stderr)
+            return 2
+        s, d = r.split("=", 1)
+        remaps.append((s, d))
+
+    # Require remaps for every userSelectedFolder
+    for f in src_user_folders:
+        if not any(_starts_with_path(f, s, src_platform) for s, _ in remaps):
+            print(
+                f"error: source userSelectedFolders entry has no --remap mapping:\n"
+                f"       {f}\n"
+                f"       Re-run with --remap {f!r}=<target-path>",
+                file=sys.stderr,
+            )
+            return 2
+
+    # Discover target Cowork workspace
+    if getattr(args, "cowork_root", None):
+        cowork_roots = [Path(args.cowork_root).expanduser().resolve()]
+    else:
+        cowork_roots = _cowork_roots()
+    try:
+        target_root, target_acct, target_workspace = _pick_target_workspace(
+            cowork_roots, getattr(args, "workspace", None)
+        )
+    except SystemExit as exc:
+        print(exc.args[0] if exc.args else "error", file=sys.stderr)
+        return 2
+
+    # Generate new task id / cli session id
+    new_task_id = src_task_id if args.keep_task_id else str(_uuid.uuid4())
+    new_cli_session_id = str(_uuid.uuid4())
+    new_task_dir = target_workspace / f"local_{new_task_id}"
+    new_task_meta = target_workspace / f"local_{new_task_id}.json"
+    new_cwd = str(new_task_dir / "outputs")
+
+    if dst_platform == "win32":
+        msg = _validate_path_for_windows(new_cwd)
+        if msg:
+            print(f"error: target cwd {new_cwd!r} {msg}", file=sys.stderr)
+            return 2
+
+    dst_sandbox = str(target_root)
+    cwd_remap = (src_cwd, new_cwd)
+    sandbox_remap = (src_sandbox, dst_sandbox)
+
+    # Plan output
+    print(f"Source bundle: {bundle}")
+    print(f"  tool_version:       {manifest.get('tool_version')}")
+    print(f"  exported_at:        {manifest.get('exported_at')}")
+    print(f"  source_platform:    {src_platform}")
+    print(f"  source_task_id:     {src_task_id}")
+    print(f"  source_cwd:         {src_cwd}")
+    print(f"  source_user_folders: {src_user_folders}")
+    print()
+    print(f"Target ({dst_platform}):")
+    print(f"  workspace:          {target_workspace}")
+    print(f"  new_task_id:        {new_task_id}")
+    print(f"  new_cli_session_id: {new_cli_session_id}")
+    print(f"  new_task_dir:       {new_task_dir}")
+    print(f"  new_task_meta:      {new_task_meta}")
+    print(f"  new_cwd:            {new_cwd}")
+    if remaps:
+        print(f"  user folder remaps: {len(remaps)}")
+        for s, d in remaps:
+            print(f"    {s} → {d}")
+    if has_auth:
+        if install_auth:
+            print(f"  auth: {sum(1 for _ in bundle_auth.iterdir())} artefact(s) → "
+                  f"{_cowork_userdata_root()}/ (same-platform restore)")
+        else:
+            print(f"  auth: skipped ({'--skip-auth' if args.skip_auth else 'cross-platform refusal'})")
+
+    if args.dry_run:
+        print()
+        print("Dry-run: no files written.")
+        return 0
+
+    if new_task_dir.exists() and not args.force:
+        print(f"error: {new_task_dir} already exists. Use --force to overwrite.",
+              file=sys.stderr)
+        return 3
+
+    new_task_dir.mkdir(parents=True, exist_ok=True)
+    (new_task_dir / "outputs").mkdir(exist_ok=True)
+    (new_task_dir / "uploads").mkdir(exist_ok=True)
+
+    print()
+    # Rewrite task.json
+    if manifest.get("source_task_id"):
+        src_task_meta = bundle / "task.json"
+        if src_task_meta.exists():
+            _rewrite_task_json(
+                src_task_meta, new_task_meta, cwd_remap, sandbox_remap,
+                new_task_id, new_cli_session_id, remaps, src_sep, dst_sep, src_platform,
+            )
+            print(f"wrote {new_task_meta}")
+
+    # Rewrite transcript.jsonl into the task's .claude/projects/<encoded>/
+    src_transcript = bundle / "transcript.jsonl"
+    if src_transcript.exists():
+        encoded = new_cwd.replace("\\", "-").replace("/", "-").replace(":", "-").replace("_", "-")
+        target_transcript = new_task_dir / ".claude" / "projects" / encoded / f"{new_cli_session_id}.jsonl"
+        counts = _rewrite_jsonl(
+            src_transcript, target_transcript, cwd_remap, remaps,
+            src_sep, dst_sep, src_platform,
+        )
+        print(
+            f"wrote {target_transcript}  "
+            f"(records: {counts['records']}, cwd: {counts['cwd']}, "
+            f"file_path: {counts['file_path']}, notebook_path: {counts['notebook_path']})"
+        )
+
+    # Rewrite audit.jsonl at task root
+    src_audit = bundle / "audit.jsonl"
+    if src_audit.exists():
+        counts = _rewrite_jsonl(
+            src_audit, new_task_dir / "audit.jsonl", cwd_remap, remaps,
+            src_sep, dst_sep, src_platform,
+        )
+        print(
+            f"wrote {new_task_dir / 'audit.jsonl'}  "
+            f"(records: {counts['records']}, cwd: {counts['cwd']})"
+        )
+
+    # Copy uploads / outputs verbatim
+    for sub in ("uploads", "outputs"):
+        srcdir = bundle / sub
+        if srcdir.is_dir():
+            for p in srcdir.rglob("*"):
+                if p.is_file():
+                    rel = p.relative_to(srcdir)
+                    dst = new_task_dir / sub / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(p, dst)
+
+    # Install auth (same-platform only — cross-platform was vetoed earlier)
+    if install_auth:
+        ud = _cowork_userdata_root()
+        ud.mkdir(parents=True, exist_ok=True)
+        installed = 0
+        for p in bundle_auth.iterdir():
+            dst = ud / p.name
+            if dst.exists() and not args.force:
+                print(f"  skip (exists): {dst}")
+                continue
+            if p.is_dir():
+                shutil.copytree(p, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(p, dst)
+            installed += 1
+        print(f"installed {installed} auth artefact(s) under {ud}")
+
+    print()
+    print(f"Done. Restart Cowork desktop; the imported task should appear in the sidebar")
+    print(f"with the new task id ({new_task_id}).")
     return 0
 
 
@@ -1637,7 +2195,80 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"comma-separated subset of {','.join(SUPPORTED_FORMATS)} (default: all)",
     )
     pe.add_argument("--no-files", action="store_true", help="skip copying uploads / outputs / touched files")
+    pe.add_argument(
+        "--include-auth", action="store_true",
+        help=(
+            "HIGH RISK: also include Cowork desktop's auth artefacts (Cookies, "
+            "Local State, etc.) so a matching same-platform import can resume "
+            "without re-logging in. Anyone with the bundle can act as your "
+            "account. Cross-platform import will REFUSE to install these. "
+            "Interactive 'I UNDERSTAND' prompt by default."
+        ),
+    )
+    pe.add_argument(
+        "--yes-i-know-this-is-risky", action="store_true",
+        help=(
+            "skip the interactive 'I UNDERSTAND' prompt for --include-auth. "
+            "Only meaningful together with --include-auth."
+        ),
+    )
     pe.set_defaults(func=cmd_export)
+
+    pi = sub.add_parser(
+        "import",
+        help="restore a previously exported Cowork bundle as a new task",
+        description=(
+            "Restore a bundle into Cowork's local-agent-mode-sessions tree. "
+            "A fresh task_id is generated by default (use --keep-task-id to "
+            "preserve the original). Path-bearing fields in task.json / "
+            "transcript.jsonl / audit.jsonl are rewritten to point at the new "
+            "task dir; sources for userSelectedFolders that don't exist on "
+            "this machine must be relocated with --remap src=dst."
+        ),
+    )
+    pi.add_argument("bundle", help="path to an exported bundle directory")
+    pi.add_argument(
+        "--cowork-root", default=None, metavar="PATH",
+        help=(
+            "override the auto-detected Cowork sessions root on the target "
+            "machine. Useful for testing or for archived restores. Same shape "
+            "as the export-side flag."
+        ),
+    )
+    pi.add_argument(
+        "--workspace", default=None, metavar="PATH",
+        help=(
+            "destination workspace dir (.../<acct>/<workspace>/). "
+            "Required when multiple Cowork accounts/workspaces are detected."
+        ),
+    )
+    pi.add_argument(
+        "--remap", action="append", metavar="SRC=DST",
+        help=(
+            "remap a userSelectedFolder / file_path prefix from source to "
+            "target. Repeat for each folder. Required for every "
+            "userSelectedFolders entry in the manifest."
+        ),
+    )
+    pi.add_argument(
+        "--keep-task-id", action="store_true",
+        help="reuse the source task_id instead of generating a fresh one (may "
+             "collide with an existing task; combine with --force to overwrite).",
+    )
+    pi.add_argument(
+        "--skip-auth", action="store_true",
+        help="ignore bundle/auth/ even if present.",
+    )
+    pi.add_argument(
+        "--dry-run", action="store_true",
+        help="print the rewrite plan and exit without writing.",
+    )
+    pi.add_argument(
+        "--force", action="store_true",
+        help="overwrite existing task dir / auth artefacts.",
+    )
+    pi.set_defaults(func=cmd_import)
+
     return p
 
 
