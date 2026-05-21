@@ -69,7 +69,10 @@ DEFAULT_OUTPUT = Path.cwd() / "exports"
 SUPPORTED_FORMATS = ("html", "md", "json", "csv")
 TOOL_RESULT_TRUNCATE = 8000
 BUNDLE_VERSION = 1
-TOOL_VERSION = "0.2.0"
+TOOL_VERSION = "0.3.0"
+SEED_TEXT_TRUNCATE = 500
+SEED_TOOL_INPUT_TRUNCATE = 200
+SEED_TOOL_RESULT_TRUNCATE = 400
 
 
 # Auth artefacts Cowork desktop maintains under its userData dir.
@@ -2142,6 +2145,325 @@ def cmd_import(args: argparse.Namespace) -> int:
     return 0
 
 
+def _truncate(text: str, limit: int) -> str:
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + f"\n… [truncated, {len(text) - limit} more chars]"
+
+
+def _demote_headers(text: str, by: int = 2) -> str:
+    """Prepend ``by`` more ``#`` chars to ATX heading lines so embedded
+    headings don't compete with the seed's own structure. Code-fenced
+    regions are left alone."""
+    if not text:
+        return text
+    out, in_fence = [], False
+    for line in text.split("\n"):
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            out.append(line); continue
+        if in_fence:
+            out.append(line); continue
+        if line.startswith("#"):
+            i = 0
+            while i < len(line) and line[i] == "#":
+                i += 1
+            if 1 <= i <= 6 and (i == len(line) or line[i] in (" ", "\t")):
+                out.append("#" * min(6, i + by) + line[i:])
+                continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _summarise_tool_use(m: FlatMessage) -> str:
+    tn = m.tool_name or "?"
+    inp = m.tool_input if isinstance(m.tool_input, dict) else {}
+    bits = []
+    for key in ("command", "file_path", "notebook_path", "pattern", "path", "url", "query"):
+        v = inp.get(key)
+        if isinstance(v, str) and v:
+            bits.append(f"{key}={_truncate(v, SEED_TOOL_INPUT_TRUNCATE)!r}")
+            break
+    return f"`{tn}`" + (f" ({', '.join(bits)})" if bits else "")
+
+
+def _summarise_tool_result(m: FlatMessage) -> str:
+    txt = (m.text or "").strip()
+    if not txt:
+        return "(empty)"
+    return _truncate(txt, SEED_TOOL_RESULT_TRUNCATE)
+
+
+def _list_bundle_files_cowork(bundle: Path) -> list[tuple[str, Path, int]]:
+    out: list[tuple[str, Path, int]] = []
+    for cat, sub in (("upload", "uploads"), ("output", "outputs"), ("asset", "assets")):
+        d = bundle / sub
+        if d.is_dir():
+            for p in sorted(d.rglob("*")):
+                if p.is_file():
+                    try:
+                        out.append((cat, p.relative_to(bundle), p.stat().st_size))
+                    except OSError:
+                        pass
+    return out
+
+
+def _render_turn_for_seed(out: list[str], turn: dict[str, Any], mode: str, index: int) -> None:
+    user_msg: FlatMessage = turn["user"]
+    body: list[FlatMessage] = turn["body"]
+    user_text = _strip_uploaded_files_wrapper(user_msg.text or "").strip()
+    out.append(f"### Turn {index} · {_fmt_ts(user_msg.timestamp)}")
+    out.append("")
+    out.append("**User:**")
+    out.append("")
+    out.append("> " + user_text.replace("\n", "\n> ") if user_text else "> _(empty)_")
+    out.append("")
+
+    asst_text_blocks = [m for m in body if m.kind == "text" and m.role == "assistant"]
+    tool_uses = [m for m in body if m.kind == "tool_use"]
+    tool_results = {m.tool_id: m for m in body if m.kind == "tool_result"}
+
+    if mode == "full":
+        for m in body:
+            if m.kind == "text" and m.role == "assistant":
+                out.append("**Assistant:**")
+                out.append("")
+                out.append(_demote_headers(m.text) or "_(empty)_")
+                out.append("")
+            elif m.kind == "thinking":
+                out.append("<details><summary>Reasoning</summary>")
+                out.append("")
+                out.append(m.text or "")
+                out.append("")
+                out.append("</details>")
+                out.append("")
+            elif m.kind == "tool_use":
+                out.append(f"_Tool call:_ {_summarise_tool_use(m)}")
+                tr = tool_results.get(m.tool_id)
+                if tr:
+                    out.append("_Tool error:_" if tr.is_error else "_Tool result:_")
+                    out.append("")
+                    out.append("```")
+                    out.append(_summarise_tool_result(tr))
+                    out.append("```")
+                out.append("")
+    elif mode == "standard":
+        if asst_text_blocks:
+            joined = "\n\n".join(b.text or "" for b in asst_text_blocks).strip()
+            out.append("**Assistant** (abridged):")
+            out.append("")
+            out.append(_demote_headers(_truncate(joined, SEED_TEXT_TRUNCATE)) or "_(no textual reply)_")
+            out.append("")
+        if tool_uses:
+            out.append(f"_Tool calls in this turn: {len(tool_uses)}_")
+            for m in tool_uses[:6]:
+                tr = tool_results.get(m.tool_id)
+                marker = " ❌" if tr and tr.is_error else ""
+                out.append(f"- {_summarise_tool_use(m)}{marker}")
+            if len(tool_uses) > 6:
+                out.append(f"- … +{len(tool_uses) - 6} more")
+            out.append("")
+
+
+def render_seed_prompt(
+    meta: SessionMeta,
+    flat: list[FlatMessage],
+    bundle_files: list[tuple[str, Path, int]],
+    mode: str,
+    bundle: Path,
+) -> str:
+    if mode not in ("brief", "standard", "full"):
+        raise ValueError(f"unknown seed mode: {mode}")
+    preamble, turns = _split_into_turns(flat)
+    n_user = len(turns)
+    n_tool = sum(1 for m in flat if m.kind == "tool_use")
+    n_think = sum(1 for m in flat if m.kind == "thinking")
+    title = meta.title or f"Claude Cowork task {meta.task_id[:8]}"
+
+    out: list[str] = []
+    out.append(f"# Continuation of a previous Cowork chat")
+    out.append("")
+    out.append(
+        "I'm resuming a previous Claude Cowork chat in a fresh conversation "
+        "(possibly under a different account or on a different machine). "
+        "Below is the context from the prior task — what we were working on, "
+        "the files involved, and where we left off. Please read it through, "
+        "then confirm you've absorbed the context and are ready to continue."
+    )
+    out.append("")
+    out.append("---")
+    out.append("")
+    out.append("## Previous task metadata")
+    out.append("")
+    out.append(f"- **Title**: {title}")
+    if meta.model:
+        out.append(f"- **Model**: `{meta.model}`")
+    if meta.space_name:
+        out.append(f"- **Space**: {meta.space_name}")
+    if meta.cwd:
+        out.append(f"- **Working dir** (on the original sandbox): `{meta.cwd}`")
+    if meta.user_folders:
+        out.append(f"- **User-selected folders** (on the original machine):")
+        for f in meta.user_folders:
+            out.append(f"  - `{f}`")
+    if meta.started_at:
+        out.append(f"- **Started**: {_fmt_ts(meta.started_at)}")
+    if meta.ended_at:
+        out.append(f"- **Ended**: {_fmt_ts(meta.ended_at)}")
+    if meta.archived:
+        out.append(f"- **Archived**: yes")
+    if meta.error:
+        out.append(f"- **Last-seen error**: {meta.error}")
+    out.append(
+        f"- **Activity**: {n_user} user prompt(s), {n_think} reasoning blocks, "
+        f"{n_tool} tool call(s)"
+    )
+    out.append("")
+
+    if meta.initial_message:
+        out.append("## Initial brief")
+        out.append("")
+        out.append(
+            "_The original task was opened with this brief. Treat it as the "
+            "long-standing goal that any continuation should still serve._"
+        )
+        out.append("")
+        out.append(
+            "> " + _demote_headers(meta.initial_message.strip()).replace("\n", "\n> ")
+        )
+        out.append("")
+
+    if bundle_files:
+        out.append("## Files carried over from the previous session")
+        out.append("")
+        out.append(
+            "The export bundle contains these files. They are either restored "
+            "into the new task working directory by the importer or sit next "
+            "to this seed prompt as raw bytes."
+        )
+        out.append("")
+        for cat, rel, size in bundle_files:
+            out.append(f"- `{rel}` ({_human_size(size)}) — {cat}")
+        out.append("")
+
+    if mode == "brief":
+        keep_turns = turns[-3:] if len(turns) > 3 else turns
+        out.append(f"## Last {len(keep_turns)} exchange(s) (verbatim)")
+        out.append("")
+        for i, turn in enumerate(keep_turns, 1):
+            _render_turn_for_seed(out, turn, mode="full", index=n_user - len(keep_turns) + i)
+    else:
+        out.append("## Conversation summary")
+        out.append("")
+        if mode == "standard":
+            out.append(
+                "_Earlier turns are summarised; the final exchange is verbatim. "
+                "Pass `--mode full` to `seed` if you need everything verbatim._"
+            )
+            out.append("")
+        for i, turn in enumerate(turns[:-1] if turns else [], 1):
+            _render_turn_for_seed(out, turn, mode=mode, index=i)
+        if turns:
+            out.append("### Final exchange (verbatim)")
+            out.append("")
+            _render_turn_for_seed(out, turns[-1], mode="full", index=n_user)
+
+    out.append("---")
+    out.append("")
+    out.append("## Please continue from here")
+    out.append("")
+    out.append(
+        "1. Confirm you've internalised the context above — note the files "
+        "in scope, the working directory, and where the conversation left off."
+    )
+    out.append(
+        "2. If you would have done something next in the previous session, "
+        "surface it now so I can approve or correct it."
+    )
+    out.append(
+        "3. Otherwise wait for my next instruction; I'll tell you what to "
+        "tackle next."
+    )
+    out.append("")
+    out.append("**Important**: any absolute paths in the context above refer to the")
+    out.append("**original sandbox / machine**. If a path doesn't exist here, ask")
+    out.append("me how to relocate it before reading or writing it.")
+    out.append("")
+    return "\n".join(out)
+
+
+def cmd_seed(args: argparse.Namespace) -> int:
+    bundle = Path(args.bundle).expanduser().resolve()
+    if not bundle.is_dir():
+        print(f"error: bundle directory does not exist: {bundle}", file=sys.stderr)
+        return 2
+    manifest_path = bundle / "manifest.json"
+    if not manifest_path.exists():
+        print(
+            f"error: not a valid bundle (missing manifest.json): {bundle}\n"
+            "       Re-export with claude-cowork-export >= 0.2.0.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"error: failed to parse manifest.json: {e}", file=sys.stderr)
+        return 2
+    if manifest.get("tool") != "claude-cowork-export":
+        print(
+            f"error: bundle was produced by {manifest.get('tool')!r}, expected "
+            "'claude-cowork-export'.",
+            file=sys.stderr,
+        )
+        return 2
+
+    transcript = bundle / "transcript.jsonl"
+    if not transcript.exists():
+        print(f"error: bundle missing transcript.jsonl: {transcript}", file=sys.stderr)
+        return 2
+
+    meta, raw = load_transcript(transcript)
+
+    # Enrich meta from task.json (Cowork puts richer metadata there).
+    task_meta = bundle / "task.json"
+    if task_meta.exists():
+        try:
+            tj = json.loads(task_meta.read_text(encoding="utf-8"))
+            meta.title = meta.title or tj.get("title", "") or ""
+            meta.model = meta.model or tj.get("model", "") or ""
+            meta.initial_message = meta.initial_message or tj.get("initialMessage", "") or ""
+            meta.user_folders = meta.user_folders or list(tj.get("userSelectedFolders") or [])
+            meta.archived = meta.archived or bool(tj.get("isArchived"))
+            meta.error = meta.error or tj.get("error", "") or ""
+            if not meta.cwd:
+                meta.cwd = tj.get("cwd", "") or meta.cwd
+        except Exception:
+            pass
+    meta.task_id = meta.task_id or manifest.get("source_task_id") or meta.cli_session_id
+
+    flat = flatten(raw)
+    files = _list_bundle_files_cowork(bundle)
+    mode = args.mode
+    seed_md = render_seed_prompt(meta, flat, files, mode, bundle)
+
+    out_path = (
+        Path(args.output).expanduser().resolve()
+        if args.output else (bundle / "seed-prompt.md")
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(seed_md, encoding="utf-8")
+    print(f"wrote {out_path}  ({len(seed_md)} chars, mode={mode})")
+    print()
+    print("Use:")
+    print("  1. Open a fresh Cowork chat under the new account / machine.")
+    print(f"  2. Paste the contents of {out_path} as your first message.")
+    print("  3. Wait for the assistant to confirm context absorption.")
+    print("  4. Continue working as usual.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="cowork_export",
@@ -2268,6 +2590,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="overwrite existing task dir / auth artefacts.",
     )
     pi.set_defaults(func=cmd_import)
+
+    ps = sub.add_parser(
+        "seed",
+        help="render seed-prompt.md from a bundle for cross-account continuation",
+        description=(
+            "Produce a self-contained Markdown prompt that can be pasted as "
+            "the first message of a brand-new Cowork chat (potentially under "
+            "a different account / machine) to continue the work from where "
+            "the previous task left off. Does not touch any auth, does not "
+            "rely on server-side state — the new chat is a fresh task with "
+            "the prior context inlined."
+        ),
+    )
+    ps.add_argument("bundle", help="path to an exported bundle directory")
+    ps.add_argument(
+        "--mode", default="standard", choices=("brief", "standard", "full"),
+        help=(
+            "how much of the prior conversation to include. brief = last 3 turns; "
+            "standard (default) = all user prompts + abridged assistant text + "
+            "tool-call summaries + last turn verbatim; full = everything verbatim."
+        ),
+    )
+    ps.add_argument(
+        "-o", "--output", "--out", dest="output", default=None, metavar="PATH",
+        help="where to write the seed prompt (default: <bundle>/seed-prompt.md)",
+    )
+    ps.set_defaults(func=cmd_seed)
 
     return p
 
