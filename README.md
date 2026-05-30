@@ -179,7 +179,8 @@ Exports one or more tasks into a self-contained bundle directory per task.
 | `--formats` | `html,md,json,csv` | Comma-separated subset of `html,md,json,csv`. |
 | `--no-files` | _(off)_ | Skip copying uploads, outputs, and touched files. Faster, smaller bundle. |
 | `--include-auth` | _(off)_ | **HIGH RISK.** Also copy Cowork's auth artefacts (Cookies, Local State, buddy-tokens, etc.) into the bundle. Only restorable on the same OS family — see [Security](#security). |
-| `--yes-i-know-this-is-risky` | _(off)_ | Skip the interactive `I UNDERSTAND` prompt when `--include-auth` is set. Only useful in CI. |
+| `--purge-source` | _(off)_ | **DESTRUCTIVE.** After each task's bundle is written and verified, delete that task's local sandbox + metadata. The external project folders the chat was attached to (`userSelectedFolders`) are never touched, nor are other tasks. Incompatible with `--no-files`. See [Deleting the local copy](#deleting-the-local-copy-after-export). |
+| `--yes-i-know-this-is-risky` | _(off)_ | Skip the interactive confirmation prompts for `--include-auth` and `--purge-source`. CI only. |
 
 **Examples:**
 
@@ -436,6 +437,42 @@ claude-cowork-export seed ./bundle/<task-id>
 claude-cowork-export export <task-id> --output ./archive
 # Now you can delete it from Cowork — the bundle is independent.
 ```
+
+### 6. Export and free up the local store (`--purge-source`)
+
+```bash
+# Archive a task AND remove its local sandbox in one step
+claude-cowork-export export <task-id> --output ./archive --purge-source
+```
+
+See [Deleting the local copy](#deleting-the-local-copy-after-export) below.
+
+---
+
+## Deleting the local copy after export
+
+`--purge-source` lets you offload a task: it is exported to a bundle and then
+removed from the local Cowork sandbox, in a single command.
+
+- **What is deleted**: the task's sandbox directory (`local_<task-id>/`,
+  holding the transcript, `uploads/`, `outputs/`, and `audit.jsonl`) and its
+  `local_<task-id>.json` metadata — across every discovered root (so the
+  Windows MSIX `%APPDATA%` + `%LOCALAPPDATA%` duplicates are both removed).
+- **What is never touched**: the external project folders the chat was
+  attached to (`userSelectedFolders` — your real working files),
+  `spaces.json`, and any other task. Only the selected task(s).
+- **Verified-before-delete**: a task is purged only after its bundle is
+  written and passes a completeness check (`transcript.jsonl` +
+  `manifest.json` present and non-empty). Failed exports leave the source
+  intact.
+- **Forced confirmation**: the tool prints exactly which paths will be
+  removed and waits for you to type `DELETE`. `--yes-i-know-this-is-risky`
+  skips the prompt for CI only.
+- **Incompatible with `--no-files`**: purging while the bundle omits the
+  uploads / outputs would make them unrecoverable, so the combination is
+  rejected.
+- **Reversible via import**: `claude-cowork-export import <bundle>` restores
+  a purged task (see [`import`](#import)).
 
 ---
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-cowork-export"
-version = "0.3.0"
+version = "0.4.0"
 description = "Export Claude Cowork (and legacy Claude Code) sessions to HTML, Markdown, JSON, CSV — with uploads, outputs, and the original transcript bundled."
 readme = "README.md"
 requires-python = ">=3.9"
