@@ -172,7 +172,8 @@ claude-cowork-export export <selector> [-o DIR] [--formats LIST]
 | `--formats` | `html,md,json,csv` | 逗号分隔的子集。 |
 | `--no-files` | _(关)_ | 不拷贝 uploads / outputs / 触碰文件，bundle 更小更快。 |
 | `--include-auth` | _(关)_ | **高风险**。同时把 Cowork 的 auth 工件（Cookies / Local State / buddy-tokens 等）装进 bundle。**只能在同一 OS 家族还原**——详见 [安全](#安全)。 |
-| `--yes-i-know-this-is-risky` | _(关)_ | 跳过 `--include-auth` 的交互式 `I UNDERSTAND` 确认，仅供 CI 使用。 |
+| `--purge-source` | _(关)_ | **破坏性**。每个 task 的 bundle 写完并校验通过后，删掉它的本地沙盒 + 元数据。chat 外挂的项目目录（`userSelectedFolders`，你的真实文件）**绝不碰**，其他 task 也不碰。不能和 `--no-files` 一起用。详见 [导出后删除本地副本](#导出后删除本地副本)。 |
+| `--yes-i-know-this-is-risky` | _(关)_ | 跳过 `--include-auth` 和 `--purge-source` 的交互式确认，仅供 CI 使用。 |
 
 **示例：**
 
@@ -419,6 +420,36 @@ claude-cowork-export seed ./bundle/<task-id>
 claude-cowork-export export <task-id> --output ./archive
 # 现在可以放心从 Cowork 删——bundle 是独立的。
 ```
+
+### 6. 导出并释放本地存储（`--purge-source`）
+
+```bash
+# 归档一个 task，同时删掉它的本地沙盒，一条命令搞定
+claude-cowork-export export <task-id> --output ./archive --purge-source
+```
+
+具体安全行为见下方 [导出后删除本地副本](#导出后删除本地副本)。
+
+---
+
+## 导出后删除本地副本
+
+`--purge-source` 让你"卸载"一个 task：先导出成 bundle，再把它从本地 Cowork 沙盒
+删掉，一条命令完成。
+
+- **删什么**：task 的沙盒目录（`local_<task-id>/`，含 transcript、`uploads/`、
+  `outputs/`、`audit.jsonl`）和它的 `local_<task-id>.json` 元数据——跨所有发现到的
+  root（Windows MSIX 的 `%APPDATA%` + `%LOCALAPPDATA%` 两份副本都删）。
+- **绝不碰什么**：chat 外挂的项目目录（`userSelectedFolders`，你的真实工作文件）、
+  `spaces.json`、以及任何其他 task。只删选中的 task。
+- **先校验再删**：只有 bundle 写好且通过完整性检查（`transcript.jsonl` +
+  `manifest.json` 存在且非空）才删源 task。导出失败则源保持不动。
+- **强制确认**：工具会打印将要删除的确切路径，并等你输入 `DELETE`。
+  `--yes-i-know-this-is-risky` 仅供 CI 跳过。
+- **与 `--no-files` 互斥**：bundle 省略 uploads / outputs 时再删源会导致不可恢复，
+  所以禁止组合。
+- **可用 import 恢复**：`claude-cowork-export import <bundle>` 能还原被 purge 的 task
+  （见 [`import`](#import)）。
 
 ---
 

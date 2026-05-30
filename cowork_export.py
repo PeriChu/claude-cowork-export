@@ -69,7 +69,7 @@ DEFAULT_OUTPUT = Path.cwd() / "exports"
 SUPPORTED_FORMATS = ("html", "md", "json", "csv")
 TOOL_RESULT_TRUNCATE = 8000
 BUNDLE_VERSION = 1
-TOOL_VERSION = "0.3.0"
+TOOL_VERSION = "0.4.0"
 SEED_TEXT_TRUNCATE = 500
 SEED_TOOL_INPUT_TRUNCATE = 200
 SEED_TOOL_RESULT_TRUNCATE = 400
@@ -1420,6 +1420,124 @@ def _resolve_auth_sources() -> list[Path]:
     return found
 
 
+def _bundle_is_complete(target: Path) -> bool:
+    """A bundle is safe to purge against only if its lossless core is on disk
+    and non-empty: transcript.jsonl + manifest.json."""
+    for name in ("transcript.jsonl", "manifest.json"):
+        p = target / name
+        try:
+            if not p.is_file() or p.stat().st_size == 0:
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def _cowork_task_purge_targets(task: Task) -> list[Path]:
+    """Every on-disk path that constitutes a Cowork task's local footprint,
+    across ALL discovered roots (Windows MSIX keeps a copy in both
+    %APPDATA% and %LOCALAPPDATA%\\Packages\\...).
+
+    Returns the task sandbox dir (`local_<id>/`, which holds the transcript,
+    uploads, outputs, audit.jsonl) plus its `local_<id>.json` metadata
+    sibling, for every workspace where the task id appears. Deliberately
+    excludes spaces.json, sibling tasks, and the external userSelectedFolders
+    (the user's real project files) — those are workspace content, never
+    touched.
+    """
+    out: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(p: Path) -> None:
+        try:
+            key = str(p.resolve())
+        except OSError:
+            key = str(p)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(p)
+
+    # The task we were handed.
+    if task.task_dir is not None:
+        _add(task.task_dir)
+    if task.task_meta_file is not None:
+        _add(task.task_meta_file)
+
+    # Re-scan every root so MSIX duplicates are caught even though discovery
+    # merged them into a single Task.
+    for root in _cowork_roots():
+        if not root.exists():
+            continue
+        for acct in sorted(root.iterdir()):
+            if not acct.is_dir():
+                continue
+            for workspace in sorted(acct.iterdir()):
+                if not workspace.is_dir():
+                    continue
+                sandbox = workspace / f"local_{task.task_id}"
+                meta = workspace / f"local_{task.task_id}.json"
+                if sandbox.exists():
+                    _add(sandbox)
+                if meta.exists():
+                    _add(meta)
+    return out
+
+
+def _confirm_purge_risk(plan: list[tuple[Task, list[Path]]], non_interactive_ack: bool) -> None:
+    n = len(plan)
+    lines = [
+        "",
+        "🔥  --purge-source requested. After a VERIFIED export, the local copy",
+        f"    of {n} task(s) will be PERMANENTLY DELETED.",
+        "",
+        "    This removes each task's sandbox (transcript, uploads, outputs,",
+        "    audit log) and its metadata. It does NOT touch the external",
+        "    project folders the chat was attached to (userSelectedFolders),",
+        "    nor spaces.json, nor any other task — only the selected task(s).",
+        "",
+        "    A task is deleted ONLY after its bundle is written and verified",
+        "    (transcript.jsonl + manifest.json present and non-empty). You can",
+        "    later restore it with `claude-cowork-export import <bundle>`.",
+        "",
+        "    To be deleted:",
+    ]
+    for task, paths in plan:
+        lines.append(f"      • {task.task_id}  {task.display_title}")
+        for p in paths:
+            lines.append(f"          rm -r  {p}")
+    lines.append("")
+    print("\n".join(lines), file=sys.stderr)
+    if non_interactive_ack:
+        print("  ack: --yes-i-know-this-is-risky given; proceeding non-interactively.",
+              file=sys.stderr)
+        return
+    try:
+        ans = input('Type "DELETE" to confirm purge after export: ').strip()
+    except EOFError:
+        ans = ""
+    if ans != "DELETE":
+        print("  abort: confirmation phrase not received; nothing will be deleted.",
+              file=sys.stderr)
+        raise SystemExit(3)
+
+
+def _purge_paths(paths: list[Path]) -> list[Path]:
+    removed: list[Path] = []
+    for p in paths:
+        try:
+            if p.is_dir() and not p.is_symlink():
+                shutil.rmtree(p)
+            elif p.exists() or p.is_symlink():
+                p.unlink()
+            else:
+                continue
+            removed.append(p)
+        except OSError as e:
+            print(f"  warn: failed to delete {p}: {e}", file=sys.stderr)
+    return removed
+
+
 def _copy_auth_for_export(target: Path, sources: list[Path]) -> dict[str, Any]:
     root = _cowork_userdata_root()
     auth_dir = target / "auth"
@@ -1719,6 +1837,17 @@ def cmd_export(args: argparse.Namespace) -> int:
     output_root = Path(args.output).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
+    purge_source = bool(getattr(args, "purge_source", False))
+    ack = bool(getattr(args, "yes_i_know_this_is_risky", False))
+    if purge_source and args.no_files:
+        print(
+            "error: --purge-source cannot be combined with --no-files.\n"
+            "       Purging would delete the task sandbox (uploads / outputs)\n"
+            "       while the bundle omits them, so they could not be restored.",
+            file=sys.stderr,
+        )
+        return 2
+
     auth_sources: list[Path] | None = None
     if getattr(args, "include_auth", False):
         auth_sources = _resolve_auth_sources()
@@ -1730,9 +1859,14 @@ def cmd_export(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        _confirm_auth_risk(bool(getattr(args, "yes_i_know_this_is_risky", False)))
+        _confirm_auth_risk(ack)
+
+    if purge_source:
+        plan = [(t, _cowork_task_purge_targets(t)) for t in targets]
+        _confirm_purge_risk(plan, ack)
 
     exported = 0
+    purged = 0
     for task in targets:
         target = export_one(
             task,
@@ -1744,8 +1878,22 @@ def cmd_export(args: argparse.Namespace) -> int:
         if target:
             print(f"exported {task.task_id} → {target}")
             exported += 1
+            if purge_source:
+                if _bundle_is_complete(target):
+                    removed = _purge_paths(_cowork_task_purge_targets(task))
+                    for p in removed:
+                        print(f"  purged {p}")
+                    purged += 1
+                else:
+                    print(
+                        f"  warn: bundle for {task.task_id} failed verification; "
+                        "source NOT purged.",
+                        file=sys.stderr,
+                    )
     if not exported:
         return 1
+    if purge_source:
+        print(f"purged {purged}/{exported} exported task(s) from local store.")
     return 0
 
 
@@ -2528,10 +2676,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     pe.add_argument(
+        "--purge-source", action="store_true",
+        help=(
+            "DESTRUCTIVE: after each task's bundle is written AND verified, "
+            "delete that task's local sandbox (transcript, uploads, outputs, "
+            "audit log) and metadata. The external project folders the chat "
+            "was attached to (userSelectedFolders) are never touched, nor are "
+            "other tasks. Cannot be combined with --no-files. Interactive "
+            "'DELETE' prompt by default."
+        ),
+    )
+    pe.add_argument(
         "--yes-i-know-this-is-risky", action="store_true",
         help=(
-            "skip the interactive 'I UNDERSTAND' prompt for --include-auth. "
-            "Only meaningful together with --include-auth."
+            "skip the interactive confirmation prompts for --include-auth "
+            "and --purge-source. For non-interactive / CI use only."
         ),
     )
     pe.set_defaults(func=cmd_export)
